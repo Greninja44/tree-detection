@@ -156,7 +156,42 @@ def test_plant_detections_reports_labels_and_bush_instances():
     z = np.zeros((H, W), bool)
     r = TraversabilityResult(np.zeros((H, W), np.uint8), np.zeros((H, W), np.float32), z, z, np.ones((H, W), bool), z, "t", False, [], labels, names)
     d = plant_detections(r)
-    assert d["source"] == "RUGD-Segformer" and d["summary"]["grass"] == pytest.approx(30.0)
+    assert d["source"] == "t" and d["summary"]["grass"] == pytest.approx(30.0)   # source = the segmentation method's name
     assert len(d["bushes"]) == 1 and d["bushes"][0][:4] == (10, 60, 50, 90)
     r.labels = None   # no semantic model: only an approximate vegetation share
     assert plant_detections(r)["source"].startswith("approximate")
+
+
+def test_segformer_wrapper_maps_classes_probabilities_and_sky():
+    import torch
+    from types import SimpleNamespace
+    from src.traversability import ADE_GROUPS, make_segformer_segmenter
+
+    id2label = {0: "wall", 1: "sky", 2: "grass", 3: "path", 4: "tree"}
+
+    class Fake:
+        config = SimpleNamespace(id2label=id2label)
+
+        def __call__(self, pixel_values):
+            logits = torch.full((1, 5, 8, 8), -10.0)
+            logits[0, 3, 4:, :] = 10.0     # lower half: path
+            logits[0, 1, :2, :] = 10.0     # top rows: sky
+            logits[0, 4, 2:4, :] = 10.0    # middle: tree
+            return SimpleNamespace(logits=logits)
+
+    seg = make_segformer_segmenter(Fake(), 32, "cpu", ADE_GROUPS, "fake")(np.zeros((64, 64, 3), np.uint8))
+    assert seg.classes.shape == (64, 64) and seg.method == "fake"
+    assert (seg.classes[40:] == TRAVERSABLE).all() and (seg.p_trav[40:] > 0.9).all()
+    assert (seg.classes[16:28] == OBSTACLE).all() and (seg.p_trav[18:24] < 0.1).all()
+    assert not seg.valid[:8].any() and seg.valid[40:].all()   # sky above the horizon is invalid
+    assert seg.label_names[3] == "path" and seg.labels is not None
+
+
+def test_available_methods_only_lists_methods_with_weights(tmp_path, monkeypatch):
+    import src.pipeline as pl
+    monkeypatch.setattr(pl, "MODELS", tmp_path)
+    monkeypatch.setattr(pl.infer, "RUGD_DIR", tmp_path / "rugd")
+    assert pl.available_methods() == [pl.CLASSICAL, "Off"]
+    (tmp_path / "deepscene").mkdir()
+    (tmp_path / "deepscene" / "fcn_resnet18.onnx").write_bytes(b"x")
+    assert pl.TERRAIN_DEEPSCENE in pl.available_methods() and pl.TERRAIN not in pl.available_methods()

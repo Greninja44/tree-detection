@@ -44,8 +44,8 @@ Training happens on a GPU PC; the Jetson (CPU-only PyTorch build) is used for in
 | Trunk detector | YOLOv8s, single class `tree_trunk` | boxes, confidence, count |
 | Ground segmentation (default) | **Classical baseline**: ground = pixels whose CLAHE-normalised Lab colour is close to the patch in front of the vehicle, low texture, below the horizon prior; no semantics, no downloads, ~0.3 s/frame | class map + P(traversable) |
 | Ground segmentation (safer) | **Classical + obstacle veto**: the same, but anything RUGD-Segformer (SegFormer-B5, 25 classes) labels as an obstacle (trees, vehicles, rocks, people ...) is removed from the ground | same |
-| Ground segmentation (terrain-aware, **new, not yet evaluated**) | Union of the classical estimate and RUGD ground classes minus obstacles, bushes, water and rocks; grass passable at lower confidence (can be switched off). Also drives the plants/terrain panel (grass, bush, tree, log, rock, water shares + bush boxes) | class map + P(traversable) + terrain labels |
-| Ground segmentation (others) | RUGD + classical hybrid (RUGD's vegetation labels veto too - most cautious); RUGD alone; custom YOLOv8s-seg path model (groomed "Track" only) | same |
+| Ground segmentation (**safer option**) | **Terrain-aware + DeepScene**: union of the classical estimate and the DeepScene FCN-ResNet18 trail/grass classes (NVIDIA jetson-inference, 43 MB, ~0.2 s/frame, runs through OpenCV), minus its obstacle/vegetation classes; grass passable at lower confidence. Also drives the plants/terrain panel (grass, vegetation, obstacle shares) | class map + P(traversable) + terrain labels |
+| Other methods (optional, weights not shipped) | DeepScene alone; ADE20K SegFormer (alone / terrain-aware); RUGD-Segformer (alone / hybrid / veto / terrain-aware). Methods appear in the GUI only if their weights are present. | same |
 | Route planner | Dijkstra on a 96-column grid; cost = 1 + k/(1+clearance) + confidence + lateral terms | route points, corridor, confidence, clearance, or an explicit reason for no route |
 | Direction | angle from lower-centre start to the route point at 60% of the look-ahead row | TURN LEFT / SLIGHT LEFT / STRAIGHT / SLIGHT RIGHT / TURN RIGHT / STOP |
 
@@ -106,7 +106,7 @@ The classical baseline is the most accurate on trails (heading agreement and err
 is also ideal for it (a pale strip right in front of the camera on snow). The veto variant is about as accurate where it
 finds a route but stops more often. RUGD alone has no snow class, which is why it does worst here.
 
-**Plants / terrain.** With *Terrain-aware* (or any RUGD-based method) the detections panel tints grass, bushes, trees, logs, rocks and water, lists their share of the image and boxes bush patches; with the classical baseline only an approximate "vegetation" share (colour-based) is shown. The terrain-aware method has unit tests but **has not been scored** against ground truth or the scenarios yet (the run was stopped), so it is not the default.
+**Plants / terrain.** With a semantic method (DeepScene, or the optional RUGD/ADE20K ones) the detections panel tints grass, bushes, trees, logs, rocks and water, lists their share of the image and boxes bush patches; with the classical baseline only an approximate "vegetation" share (colour-based) is shown. The DeepScene terrain-aware method is scored above; it is not the default because of its false STOPs on litter-covered summer floors.
 
 **The classical baseline has no safety veto.** In the scenarios below it reports routes where none exists (dense
 vegetation, dense forest, a narrow gap between trunks) and paints a parked machine as ground. Use *Classical + obstacle
@@ -131,15 +131,32 @@ Real-image scenarios (`scripts/nav_scenarios.py --method ...`, frames picked by 
 Takeaway: the default is accurate on trails but not safe in clutter; the veto variant removes the false GOs on trees, trunks and
 machines but not on dense bushes (only the RUGD-vegetation veto in the hybrid catches those, at the cost of missing routes on grass).
 
+### Models evaluated and rejected
+
+Same 68 FinnWoodlands frames and the same planner (`scripts/eval_navigation.py`; groomed-track proxy, see caveats above):
+
+| Ground segmentation | Route found | Heading on correct side | Mean heading error | Notes |
+|---|---|---|---|---|
+| Classical baseline (default) | 56/68 | 77% | 12.0° | no downloads; false routes in clutter |
+| **Terrain-aware, classical + DeepScene** | **58/68** | **83%** | 13.2° | stops correctly in dense vegetation/forest and at a machine; **false STOPs on 3 of 11 leaf-litter forest-floor scenarios** |
+| DeepScene alone | 55/68 | 76% | 14.9° | |
+| Terrain-aware, classical + RUGD | 56/68 | 59% | 20.9° | least accurate; 339 MB, ~5 s/frame -> **weights deleted** |
+| ADE20K SegFormer-B2 alone | 32/68 | 81% | 13.3° | misses snow; NVIDIA non-commercial license -> **deleted** |
+| Terrain-aware, classical + ADE20K | 45/68 | 78% | 15.9° | **deleted** |
+
+Trunk detection, 341 test images at confidence 0.05: **our YOLOv8s mAP@0.5 0.746 (recall 0.87)** vs. YOLOE-11s zero-shot with the prompt "tree trunk" **0.032 (recall 0.04)** -> YOLOE **rejected and deleted**. No pretrained, openly licensed under-canopy trunk detector with released weights was found.
+Also deleted as bad/superseded: the first CPU-trained trunk model (mAP 0.36) and the YOLOv8-seg path model (found a path in 4/30 frames outside its own forest). All of these can be re-created; see the model-setup commands.
+
 ---
 
 ## Remaining work
 
 - [ ] **Representative path data**: no ground-truth *routes* exist for these forests; the check above uses only the groomed-track mask. Label drivable corridors on images from the target robot's camera and measure route/heading accuracy properly.
+- [ ] **Fine-tune DeepScene (or another small segmenter) on litter-covered forest floors** to remove its false STOPs there, then re-score; RUGD/ADE20K lost to it here.
 - [ ] **Fine-tune a forest segmentation model** (traversable / vegetation / obstacle) on that data; RUGD has no snow class and was not validated on your camera. The hybrid is a stop-gap.
 - [ ] **Depth and calibration** for real navigation: a single 2D image cannot give metric clearance or guarantee collision-free motion. Add stereo/depth (FinnWoodlands has depth), camera intrinsics and the vehicle footprint, and convert the image-plane corridor to a ground-plane cost map.
 - [ ] **Closed-loop validation**: the direction labels are steering *suggestions*. Test on the vehicle in a safe area with an independent safety stop before using them as commands.
-- [ ] **Real-time on Jetson**: install a JetPack-matched PyTorch (or export to TensorRT). Today a frame takes ~1 s for trunks plus ~4 s for RUGD at 480 px on CPU.
+- [ ] **Real-time on Jetson**: install a JetPack-matched PyTorch (or export to TensorRT). Today a frame takes ~1 s for trunks plus ~0.2 s for DeepScene (or ~0.3 s classical) at 480 px on CPU.
 - [ ] **Low light**: heavily darkened images produce noisy segmentation and STOP; evaluate on real night/dusk data.
 - [ ] **Higher-accuracy trunk run** (planned, not run): `python train_on_pc.py --only trunk --trunk-model yolov8m.pt --imgsz 960 --batch 8 --epochs 150 --patience 50 --tag _m960`
 - [ ] **Bright-daylight / overcast data**: trunk recall in bright sun is only 0.25 and the datasets do not cover all five lighting conditions; add real lighting labels (`data/lighting_labels.json`).
@@ -186,7 +203,7 @@ python -m pytest
 .venv/bin/streamlit run app.py --server.port 8517
 ```
 
-Upload a `.jpg`/`.png`. The page shows three panels - **Original**, **Tree & obstacle detections**, **Navigation** (traversable
+Upload a **`.jpg`/`.png` image or a video** (`.mp4`, `.avi`, `.mov`, `.mkv`, `.webm`). For a video, choose every-Nth-frame and a frame limit, press *Process video*, and you get a progress bar, an annotated clip that plays in the page (VP8 WebM, downloadable), a frame-by-frame viewer with all three panels, heading and coverage charts, a per-frame table and a CSV download; the route is smoothed across frames, the heading is damped, and a lost route stops immediately. For an image the page shows three panels - **Original**, **Tree & obstacle detections**, **Navigation** (traversable
 ground in green, obstacles red, safety margin/uncertain yellow, route cyan with start/target markers, corridor outline,
 heading arrow and legend) - plus metrics: trees detected, path coverage, traversable area, route confidence, whether a
 continuous route exists, clearance and the direction.
@@ -241,14 +258,23 @@ and *valid* pixels exclude sky. Unknown, vegetation and obstacle pixels stay in 
 same count over the whole valid image. A route is reported only if it satisfies continuity, clearance and confidence - ground pixels alone
 never imply a valid route.
 
-**Model setup.** Required: `models/tree_trunk.pt` (trained on the PC, see `pc_bundle/README.txt`). For RUGD and the hybrid:
+**Model setup.** Required: `models/tree_trunk.pt` (trained on the PC, see `pc_bundle/README.txt`). For the DeepScene-based terrain-aware method:
+
+```bash
+mkdir -p models/deepscene && cd models/deepscene
+curl -L -o ds.tar.gz https://github.com/dusty-nv/jetson-inference/releases/download/model-mirror-190618/FCN-ResNet18-DeepScene-576x320.tar.gz
+tar -xzf ds.tar.gz --strip-components=1 && rm ds.tar.gz        # leaves fcn_resnet18.onnx, classes.txt
+```
+
+(Check the DeepScene dataset's license before commercial use; I did not verify it.) Optional, only if you want those methods back:
 
 ```bash
 pip install transformers safetensors huggingface_hub
 python -c "from huggingface_hub import snapshot_download as s; s('JasonTStanley/RUGD-Segformer', local_dir='models/rugd_segformer')"
+python -c "from huggingface_hub import snapshot_download as s; s('nvidia/segformer-b2-finetuned-ade-512-512', local_dir='models/ade_segformer_b2', allow_patterns=['*.json','pytorch_model.bin'])"
 ```
 
-The default *Classical baseline* needs no downloads; *Classical + obstacle veto*, the hybrid and RUGD need the weights above.
+The default *Classical baseline* needs no downloads; the other methods need their weights above and appear in the GUI only when present.
 
 **Limits - please read.** This is a *visual* local route estimate from one 2D image. Without depth, camera calibration and vehicle geometry
 it cannot guarantee a collision-free path, and the labels are steering suggestions, not validated control commands. RUGD was not trained on
@@ -565,7 +591,7 @@ tree-detection/
 ## 11. Testing
 
 ```bash
-.venv/bin/python -m pytest           # 102 tests
+.venv/bin/python -m pytest           # 105 tests
 .venv/bin/python -m pytest -v        # verbose
 ```
 

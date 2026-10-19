@@ -46,3 +46,6 @@ pc_bundle/runs/
 pc_bundle/results/
 pc_bundle/venv/
 pc_bundle/*.yaml
+models/deepscene/
+models/ade_segformer_b2/
+models/candidates/

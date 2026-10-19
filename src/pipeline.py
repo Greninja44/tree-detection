@@ -11,7 +11,8 @@ from src import infer
 from src.navigation import (STOP, Direction, DirectionSmoother, NavConfig, PathPlan, estimate_navigation_direction,
                             path_coverage, plan_local_path)
 from src.traversability import (Segmenter, TravConfig, TraversabilityResult, detect_traversable_region,
-                                make_hybrid_segmenter, make_rugd_segmenter, make_terrain_segmenter, make_veto_segmenter,
+                                make_ade_segmenter, make_deepscene_segmenter, make_hybrid_segmenter, make_rugd_segmenter,
+                                make_segformer_segmenter, make_terrain_segmenter, make_veto_segmenter,
                                 make_yolo_path_segmenter, plant_detections)
 
 MODELS = infer.PROJECT_ROOT / "models"
@@ -19,7 +20,23 @@ HYBRID = "RUGD + classical hybrid"
 TERRAIN = "Terrain-aware (classical + RUGD)"
 VETO = "Classical + obstacle veto"
 CLASSICAL = "Classical baseline"
-PATH_METHODS = (CLASSICAL, TERRAIN, VETO, HYBRID, "RUGD-Segformer", "YOLO path model", "Off")
+DEEPSCENE = "DeepScene FCN"
+ADE = "ADE20K SegFormer"
+TERRAIN_DEEPSCENE = "Terrain-aware (classical + DeepScene)"
+TERRAIN_ADE = "Terrain-aware (classical + ADE20K)"
+PATH_METHODS = (CLASSICAL, TERRAIN, TERRAIN_DEEPSCENE, TERRAIN_ADE, VETO, HYBRID, "RUGD-Segformer", DEEPSCENE, ADE, "YOLO path model", "Off")
+
+
+def available_methods() -> list[str]:
+    """Path methods whose weights are present (the classical baseline and Off always are)."""
+    has = {"rugd": (infer.RUGD_DIR / "model.safetensors").exists(),
+           "deepscene": (MODELS / "deepscene" / "fcn_resnet18.onnx").exists(),
+           "ade": (MODELS / "ade_segformer_b2" / "pytorch_model.bin").exists(),
+           "yolo": (MODELS / "forest_path_seg.pt").exists()}
+    needs = {CLASSICAL: True, "Off": True, TERRAIN: has["rugd"], VETO: has["rugd"], HYBRID: has["rugd"],
+             "RUGD-Segformer": has["rugd"], TERRAIN_DEEPSCENE: has["deepscene"], DEEPSCENE: has["deepscene"],
+             TERRAIN_ADE: has["ade"], ADE: has["ade"], "YOLO path model": has["yolo"]}
+    return [m for m in PATH_METHODS if needs[m]]
 
 
 class ModelUnavailable(RuntimeError):
@@ -92,9 +109,42 @@ class Models:
                 raise ModelUnavailable(f"Could not load RUGD-Segformer ({exc}).", "pip install transformers safetensors")
         return self._cache["rugd"]
 
+    def deepscene_path(self) -> Path:
+        p = MODELS / "deepscene" / "fcn_resnet18.onnx"
+        if not p.exists():
+            raise ModelUnavailable(f"DeepScene model not found: {p}.", "Download FCN-ResNet18-DeepScene-576x320 from the jetson-inference model mirror (see README).")
+        return p
+
+    def ade(self):
+        d = MODELS / "ade_segformer_b2"
+        if not (d / "pytorch_model.bin").exists():
+            raise ModelUnavailable(f"ADE20K SegFormer weights not found in {d}.",
+                                   "Run: python -c \"from huggingface_hub import snapshot_download as s; s('nvidia/segformer-b2-finetuned-ade-512-512', local_dir='models/ade_segformer_b2')\"")
+        if "ade" not in self._cache:
+            from transformers import SegformerForSemanticSegmentation
+            self._cache["ade"] = SegformerForSemanticSegmentation.from_pretrained(str(d)).eval()
+        return self._cache["ade"]
+
+    def primary(self, name: str, imgsz: int, device: str) -> Segmenter:
+        if name == "RUGD":
+            return make_rugd_segmenter(self.rugd(), imgsz, device)
+        if name == "DeepScene":
+            return make_deepscene_segmenter(str(self.deepscene_path()))
+        if name == "ADE20K":
+            return make_ade_segmenter(self.ade().to(device), max(imgsz, 512), device)
+        raise ValueError(name)
+
     def segmenter(self, method: str, imgsz: int, device: str, path_weights: str, allow_grass: bool = True) -> Segmenter | None:
         if method == TERRAIN:
             return make_terrain_segmenter(make_rugd_segmenter(self.rugd(), imgsz, device), allow_grass)
+        if method == TERRAIN_DEEPSCENE:
+            return make_terrain_segmenter(self.primary("DeepScene", imgsz, device), allow_grass)
+        if method == TERRAIN_ADE:
+            return make_terrain_segmenter(self.primary("ADE20K", imgsz, device), allow_grass)
+        if method == DEEPSCENE:
+            return self.primary("DeepScene", imgsz, device)
+        if method == ADE:
+            return self.primary("ADE20K", imgsz, device)
         if method == "RUGD-Segformer":
             return make_rugd_segmenter(self.rugd(), imgsz, device)
         if method == VETO:

@@ -137,3 +137,10 @@ def test_smoother_stops_immediately_resumes_after_consecutive_frames_and_damps_j
     assert s.update(Direction(STOP, None)).label == STOP             # immediate stop
     assert s.update(Direction("TURN LEFT", -40.0)).label == STOP     # needs resume_frames
     assert s.update(Direction("TURN LEFT", -40.0)).label == "TURN LEFT"
+
+
+def test_smoother_can_trust_the_first_valid_frame_of_a_fresh_video():
+    s = DirectionSmoother(start_stopped=False)
+    assert s.update(Direction("SLIGHT LEFT", -12.0)).label == "SLIGHT LEFT"
+    assert s.update(Direction(STOP, None)).label == STOP                 # still stops immediately on loss
+    assert s.update(Direction("STRAIGHT", 0.0)).label == STOP            # and needs two valid frames to resume

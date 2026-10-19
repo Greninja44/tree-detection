@@ -57,7 +57,7 @@ def draw_detections(image: np.ndarray, boxes: Sequence[Sequence[float]], trav: T
         cv2.rectangle(out, (int(x0), int(y0)), (int(x1), int(y1)), ORANGE, 2)
         _text(out, f"trunk {c:.2f}", (int(x0), max(14, int(y0) - 4)), 0.45, ORANGE)
     n_b = len((plants or {}).get("bushes", []))
-    _text(out, f"{len(boxes)} trunk(s)" + (f", {n_b} bush(es)" if plants and plants.get("source") == "RUGD-Segformer" else ""), (6, 18), 0.55)
+    _text(out, f"{len(boxes)} trunk(s)" + (f", {n_b} bush(es)" if n_b else ""), (6, 18), 0.55)
     y = 40
     for col, label in legend:
         cv2.rectangle(out, (8, y - 9), (22, y + 3), col, -1)
