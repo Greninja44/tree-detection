@@ -1,0 +1,34 @@
+# YOLO dataset configuration for the tree-trunk detector.
+#
+# Expected layout (paths are resolved relative to this file):
+#
+#   data/
+#   ├── images/
+#   │   ├── train/   *.jpg|png        ── training images
+#   │   ├── val/     *.jpg|png        ── validation images (threshold/model selection)
+#   │   └── test/    *.jpg|png        ── test images (FINAL evaluation only)
+#   └── labels/
+#       ├── train/   *.txt            ── YOLO labels, one line per object:
+#       ├── val/     *.txt               `class cx cy w h`  (normalized 0..1)
+#       └── test/    *.txt
+#
+# Label files must share the image stem (forest_001.jpg -> forest_001.txt).
+# This project uses a single class named `tree_trunk` (class id 0).
+#
+# Validate the dataset before training:
+#   python scripts/train.py --validate-only --data configs/dataset.yaml
+#
+# NOTE: no dataset is bundled with this repository.  See README.md
+# ("Dataset acquisition and annotation") for where to obtain or how to
+# annotate a forest/tree-trunk dataset.
+
+path: ../data
+train: images/train
+val: images/val
+test: images/test
+
+# Number of classes and their names.  The detector treats a checkpoint as a
+# tree model only when its class list contains a tree/trunk-like name.
+nc: 1
+names:
+  0: tree_trunk
