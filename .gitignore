@@ -34,3 +34,15 @@ lightning_logs/*
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Raw/downloaded datasets, derived datasets, pretrained weights, PC training artifacts
+data/raw/
+data_path/
+models/rugd_segformer/
+pc_bundle/*.zip
+pc_bundle/data/
+pc_bundle/data_path/
+pc_bundle/runs/
+pc_bundle/results/
+pc_bundle/venv/
+pc_bundle/*.yaml

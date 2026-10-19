@@ -1,0 +1,2 @@
+# Same Ultralytics release as the Jetson, so the .pt files load there without surprises.
+ultralytics==8.4.182
