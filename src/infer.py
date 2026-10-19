@@ -38,8 +38,9 @@ def load_rugd():
     return SegformerForSemanticSegmentation.from_pretrained(str(RUGD_DIR)).to(device()).eval()
 
 
-def detect_trunks(model, img_bgr: np.ndarray, conf: float, imgsz: int) -> list[tuple[float, float, float, float, float]]:
-    r = model.predict(img_bgr, conf=conf, imgsz=imgsz, device=device(), verbose=False)[0]
+def detect_trunks(model, img_bgr: np.ndarray, conf: float, imgsz: int,
+                  dev: str | None = None) -> list[tuple[float, float, float, float, float]]:
+    r = model.predict(img_bgr, conf=conf, imgsz=imgsz, device=dev or device(), verbose=False)[0]
     return [(*map(float, b), float(c)) for b, c in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy())]
 
 
