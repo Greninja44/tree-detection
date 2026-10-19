@@ -50,6 +50,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--optimizer", default="auto", help="Optimizer name or 'auto'.")
     p.add_argument("--lr0", type=float, default=0.01, help="Initial learning rate.")
     p.add_argument("--seed", type=int, default=0, help="Random seed.")
+    p.add_argument("--hsv-v", type=float, default=0.4, help="Brightness (value) augmentation range; raise for lighting robustness.")
+    p.add_argument("--hsv-s", type=float, default=0.7, help="Saturation augmentation range.")
     p.add_argument("--validate-only", action="store_true", help="Only validate the dataset structure, do not train.")
     return p.parse_args(argv)
 
@@ -112,6 +114,13 @@ def validate_dataset_yaml(data_yaml: Path) -> list[str]:
             continue
         image_dir = split_path / "images" if (split_path / "images").is_dir() else split_path
         label_dir = split_path / "labels" if (split_path / "labels").is_dir() else image_dir
+        # Ultralytics convention: swap the `images` path component for `labels`.
+        parts = list(image_dir.parts)
+        if "images" in parts:
+            i = len(parts) - 1 - parts[::-1].index("images")
+            conv = Path(*parts[:i], "labels", *parts[i + 1:])
+            if conv.is_dir():
+                label_dir = conv
         images = [f for f in sorted(image_dir.rglob("*")) if f.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS]
         if not images:
             problems.append(f"Split '{split}' contains no images: {image_dir}")
@@ -215,6 +224,8 @@ def main(argv: list[str] | None = None) -> int:
             optimizer=args.optimizer,
             lr0=args.lr0,
             seed=args.seed,
+            hsv_v=args.hsv_v,
+            hsv_s=args.hsv_s,
             exist_ok=True,
         )
     except Exception as exc:
@@ -232,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  metrics  : {metrics_path if metrics_path.exists() else 'results.csv not found'}")
     if best.exists():
         print("\nNext steps:")
-        print(f"  python scripts/evaluate.py --weights {best} --images data/images_test --labels data/labels_test")
+        print(f"  python scripts/evaluate.py --weights {best} --images data/images/test --labels data/labels/test")
         print(f"  .venv/bin/streamlit run app.py")
     return 0
 

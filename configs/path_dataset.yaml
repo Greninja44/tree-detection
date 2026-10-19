@@ -1,0 +1,8 @@
+# YOLO-seg dataset for drivable forest path ("track") segmentation (FinnWoodlands masks).
+path: ../data_path
+train: images/train
+val: images/val
+test: images/test
+nc: 1
+names:
+  0: path

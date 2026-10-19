@@ -1,38 +1,102 @@
-# Robust Tree Trunk Detection Under Different Lighting Conditions
+# Robust Tree Trunk Detection and Forest-Path Isolation
 
-A complete computer-vision pipeline for detecting **tree trunks in forest imagery and video
-under varying lighting conditions** — bright sunlight, partial shade, deep shadow, overcast,
-low light and uneven illumination — with a strong emphasis on *measuring* how lighting
-affects detector behaviour.
+A computer-vision pipeline for **detecting tree trunks and isolating the drivable path in forest
+imagery** under varying lighting (bright sunlight, partial shade, deep shadow, overcast, low
+light), with an emphasis on *measuring* how lighting affects the models.
 
 The project provides:
 
-- YOLO-based detection over **images, image folders, videos and (optionally) webcams**
-- bounding boxes + confidence scores + **tree counts** + per-image inference time/FPS
-- **lighting analysis**: measured image statistics and human-assigned real-world labels
-- **synthetic lighting transformations** (brightness, gamma, contrast, shadow, noise)
-- a **training pipeline** for a custom `tree_trunk` YOLO model
-- an **evaluation module**: precision, recall, F1, AP, mAP@0.5, mAP@0.5:0.95,
-  false positives/negatives, timing, FPS and tree-count MAE — **per lighting category**
-- comparison **charts** and machine-readable **CSV/JSON** exports
-- an interactive **Streamlit** app with Detection, Lighting Analysis,
-  Evaluation Dashboard and Model Settings sections
-- **pytest** unit tests covering processing, lighting statistics and metrics
+- a **YOLOv8 tree-trunk detector** trained on public forest datasets (bounding boxes, confidence, tree counts)
+- **drivable-path isolation** two ways: a small custom YOLOv8-seg model and the pretrained
+  [RUGD-Segformer](https://huggingface.co/JasonTStanley/RUGD-Segformer) (25 off-road classes)
+- a **simple GUI** (Streamlit): upload an image -> tree detections + path overlay + steering offset
+- batch inference over images, folders and videos; **lighting analysis** and **synthetic lighting
+  transformations** (brightness, gamma, contrast, shadow, noise)
+- an **evaluation module**: precision, recall, F1, AP, mAP, FP/FN, timing and tree-count MAE,
+  **per lighting category**, with charts and CSV/JSON exports
+- dataset import scripts, a validated training pipeline, and a **Windows-GPU training bundle**
+- **pytest** unit tests (68)
 
 ---
 
-## ⚠️ Honest status of this repository
+## Architecture
 
-| Item | Status |
-|---|---|
-| Pipeline, UI, metrics, charts, tests | ✅ implemented and tested (see *Testing*) |
-| Custom `tree_trunk` weights | ❌ **not included** — no trained checkpoint ships with this repo |
-| Tree dataset | ❌ **not included** — no dataset could be verified/downloaded here |
-| Detection accuracy figures | ❌ **unavailable** until you train on labeled data — nothing is fabricated |
-| Generic COCO baseline (`yolov8n.pt`) | ⚠️ runs as a *pipeline baseline only*; it has **no** `tree_trunk` class and its boxes are **not** tree detections |
+Training happens on a GPU PC; the Jetson (CPU-only PyTorch build) is used for inference.
 
-The app and scripts state this explicitly at runtime: if no compatible checkpoint is
-present, you get a **setup message**, never silently wrong "tree" detections.
+```
+ PUBLIC DATA                         WINDOWS PC (RTX GPU)                    JETSON (inference)
+ ┌──────────────────────┐   scripts  ┌──────────────────────┐   scp .pt     ┌────────────────────────────┐
+ │ ForTrunkDet (Zenodo) │──import_──▶│ pc_bundle/           │──────────────▶│ models/tree_trunk*.pt      │
+ │ FinnWoodlands (HF)   │  *.py      │  train_on_pc.py      │               │ models/forest_path_seg.pt  │
+ └──────────────────────┘            │  YOLOv8s  (trunks)   │               │ models/rugd_segformer/     │
+        │ split: contiguous          │  YOLOv8s-seg (path)  │               └─────────────┬──────────────┘
+        ▼ blocks (no leakage)        └──────────────────────┘                             │
+ data/{images,labels}/{train,val,test}                                                    ▼
+ data_path/...  (YOLO-seg polygons)                         src/infer.py  ◀── app.py (Streamlit GUI)
+                                                              │  detect_trunks()   YOLOv8 boxes
+                                                              │  segment_path_yolo()  YOLOv8-seg mask
+                                                              └  segment_path_rugd()  SegFormer-B5 mask
+                                                      scripts/{batch_detect,evaluate,detect_path,rugd_segment}.py
+```
+
+| Component | Model | Input -> output |
+|---|---|---|
+| Trunk detector | YOLOv8s (Ultralytics), single class `tree_trunk` | image -> boxes + confidence + count |
+| Path (custom) | YOLOv8s-seg, single class `path` (FinnWoodlands "Track" masks) | image -> path mask, coverage, left/right offset |
+| Path (pretrained) | RUGD-Segformer (SegFormer-B5, 339 MB) | image -> 25-class map; `dirt/sand/gravel/mulch/asphalt` = drivable, `tree/log` = trees |
+
+The "offset" is the lateral centre of the path in the lower quarter of the frame
+(-1 far left, 0 centred, +1 far right) - a steering hint, not a planner.
+
+### Data used
+
+| Dataset | Used for | Size after import | License |
+|---|---|---|---|
+| [ForTrunkDet](https://zenodo.org/records/5213825) (Portuguese forests, 4 cameras) | trunk boxes | 2,029 visible-light images (thermal skipped) | CC BY 4.0 |
+| [FinnWoodlands](https://huggingface.co/datasets/Voxel51/FinnWoodlands) (Finnish forests) | trunk boxes + path masks | 250 images | (c) Springer Nature, research use - check before commercial use |
+
+Combined trunk dataset: **1,595 train / 343 val / 341 test** images. Splits are contiguous blocks
+per camera/site, because the images are sequential video frames (random splits leak).
+Images are not committed; recreate them with `scripts/import_fortrunkdet.py` and
+`scripts/import_finnwoodlands.py` (see Section 5).
+
+### Results so far (held-out test split, confidence 0.4)
+
+Trunk detector (YOLOv8s, 640 px, trained 100 epochs on an RTX 5080), 341 test images:
+
+| | Precision | Recall | mAP@0.5 | mAP@0.5:0.95 | Count MAE | CPU time/frame (Jetson) |
+|---|---|---|---|---|---|---|
+| First CPU-trained baseline (YOLOv8n, 175 imgs) | 0.52 | 0.49 | 0.36 | 0.16 | 1.98 | 0.34 s |
+| **Current (YOLOv8s, 1,595 imgs)** | **0.73** | **0.71** | **0.64** | **0.38** | **1.29** | 0.99 s |
+
+By lighting category (categories are **image-statistics estimates**, not human labels):
+
+| Category | Images | mAP@0.5 | Recall |
+|---|---|---|---|
+| deep_shadow | 193 | 0.65 | 0.73 |
+| partial_shade | 113 | 0.65 | 0.71 |
+| bright_daylight | 28 | **0.24** | **0.25** |
+| low_light | 7 | 0.77 | 0.81 (too few images to trust) |
+
+Path model (YOLOv8s-seg): test mAP@0.5 0.995, mAP@0.5:0.95 about 0.72 - **on only 37 images /
+17 path instances from one Finnish forest, so treat as unproven.** It learns the narrow groomed
+"Track" class, not every drivable surface. RUGD-Segformer marks all drivable-looking ground
+(more general, but also marks any forest floor, and runs about 8 s/frame on the Jetson CPU).
+
+---
+
+## Remaining work
+
+- [ ] **Higher-accuracy trunk run** (planned, not run): `python train_on_pc.py --only trunk --trunk-model yolov8m.pt --imgsz 960 --batch 8 --epochs 150 --patience 50 --tag _m960`
+- [ ] **Bright-daylight / overcast data**: bright-sun recall is only 0.25 and no dataset here covers all five lighting conditions. Collect or find more, then retrain.
+- [ ] **Real lighting labels**: create `data/lighting_labels.json`; current categories are estimated from pixels.
+- [ ] **Path models compared on real frames**: custom YOLOv8-seg vs RUGD-Segformer side by side, with a quantitative metric, on images from the target robot's camera. Gather path labels beyond one Finnish forest.
+- [ ] **Real-time on Jetson**: install a JetPack-matched PyTorch (or export to TensorRT) so inference uses the GPU; today it is about 1 s/frame (trunks) and about 8 s/frame (RUGD) on CPU.
+- [ ] **Tree-count accuracy**: count MAE is 1.29 per image; tune the confidence threshold on the val split (never the test split) and check the dataset's unlabelled-trunk effect on false positives.
+- [ ] **Lighting robustness A/B** with the new weights (synthetic darker/brighter/low-contrast/shadow variants; scripts exist, results not yet generated). The old Streamlit Lighting Analysis and Evaluation tabs were removed in the GUI rewrite - the CLI (`scripts/evaluate.py`) still does this; re-add to the GUI if wanted.
+- [ ] **Model weights hosting**: `*.pt` is git-ignored; publish trained weights (release / Hugging Face) so others need not retrain.
+- [ ] **Licenses**: RUGD-Segformer weights list no license; FinnWoodlands is research-use. Confirm before any commercial deployment.
+- [ ] **Temporal-leakage audit**: splits are contiguous blocks, but frames at block borders are still near-neighbours.
 
 ---
 
@@ -46,7 +110,7 @@ present, you get a **setup message**, never silently wrong "tree" detections.
   Jetson/Orin), the app falls back to CPU instead of crashing.
 
 Libraries: OpenCV, Ultralytics YOLO, PyTorch, NumPy, Pandas, Matplotlib, Seaborn,
-Streamlit, pytest, PyYAML.
+Streamlit, Transformers (for RUGD-Segformer), pytest, PyYAML.
 
 ---
 
@@ -71,25 +135,22 @@ python -m pytest
 ## 3. Launch the application
 
 ```bash
-.venv/bin/streamlit run app.py
+.venv/bin/streamlit run app.py --server.port 8517
 ```
 
-Then open the printed URL (default `http://localhost:8501`).
+Open `http://<host>:8517`, upload a `.jpg`/`.png`, and the page shows the **tree detections**
+(count + boxes), the **drivable path** (green overlay, coverage, left/ahead/right offset) and a
+combined view. The sidebar picks the trunk model (any `models/tree_trunk*.pt`), the path method
+(YOLO path model / RUGD-Segformer / off), trunk confidence and inference size. The inference
+logic lives in `src/infer.py`, so it can be reused without the GUI.
 
-Useful options:
+Command-line equivalents:
 
 ```bash
-.venv/bin/streamlit run app.py --server.headless true --server.port 8502
+python scripts/batch_detect.py --source data/images/test --output outputs/test --weights models/tree_trunk.pt --conf 0.4
+python scripts/detect_path.py  --source data/images/test --weights models/forest_path_seg.pt
+python scripts/rugd_segment.py --source data/images/test --max-images 8
 ```
-
-### Sections
-
-| Tab | What it does |
-|---|---|
-| **🔎 Detection** | Upload an image/video (or load the synthetic demo fixture), set confidence threshold, run detection, view original vs. annotated side by side, tree count, inference time/FPS, download annotated output. |
-| **🌗 Lighting Analysis** | Measured brightness/contrast statistics, assigned real-world lighting category, generation of synthetic lighting variants and a per-variant detection comparison table. |
-| **📊 Evaluation Dashboard** | Batch evaluation of a labeled test split → metrics by lighting category, per-image table, comparison charts, CSV/JSON export. |
-| **⚙️ Model Settings** | Checkpoint selection, inference size, active device, and an explanation of when a custom tree-trunk model is required. |
 
 ---
 
@@ -103,7 +164,7 @@ tree/trunk-like class (e.g. `tree_trunk`).
 cp /path/to/your/best.pt models/tree_trunk.pt
 ```
 
-or pass an explicit path in the **Model Settings** tab / `--weights` CLI flag.
+or pass an explicit path with the `--weights` CLI flag, or pick a `models/tree_trunk*.pt` file in the GUI sidebar.
 
 Resolution rules (`src/detector.py`):
 
@@ -266,7 +327,7 @@ mean/median gray intensity, contrast (std), `%` dark pixels (`<60`), `%` bright 
 `darker`, `brighter`, `gamma`, `low_contrast`, `shadow`, `noise`, each with a strength
 in `[0, 1]`. Originals are never modified; variants are saved separately and tracked as
 `synthetic:<name>` so they are never confused with genuine real-world labels. Generate
-them from the **Lighting Analysis** tab or in code:
+them in code (`src/lighting_augmentation.py`):
 
 ```python
 from src.lighting_augmentation import generate_variants, save_variant
@@ -303,8 +364,6 @@ Reported files: `metrics.json`, `metrics.csv` (per lighting category),
 - `confidence_by_lighting.png`
 
 (The first three are only generated when ground truth exists.)
-
-The same run is available from the **Evaluation Dashboard** tab.
 
 ---
 
@@ -347,13 +406,15 @@ directions before adopting any preprocessing.
 
 ```
 tree-detection/
-├── app.py                        # Streamlit UI (4 tabs)
+├── app.py                        # Streamlit GUI: image in -> trunks + path out
 ├── requirements.txt
 ├── pytest.ini
 ├── README.md
 ├── configs/
-│   └── dataset.yaml              # YOLO dataset config (1 class: tree_trunk)
+│   ├── dataset.yaml              # YOLO trunk dataset (1 class: tree_trunk)
+│   └── path_dataset.yaml         # YOLO-seg path dataset (1 class: path)
 ├── src/
+│   ├── infer.py                  # single-image trunk detection + path isolation (used by app.py)
 │   ├── detector.py               # YOLO loading, capability checks, NMS, caching
 │   ├── preprocessing.py          # input validation, loaders, folder/video helpers
 │   ├── lighting_analysis.py      # statistics + category labels
@@ -363,27 +424,36 @@ tree-detection/
 │   ├── visualization.py          # drawing + charts
 │   └── synthetic_fixtures.py     # clearly-marked synthetic demo images
 ├── scripts/
+│   ├── import_fortrunkdet.py     # ForTrunkDet (Pascal VOC) -> YOLO, contiguous splits
+│   ├── import_finnwoodlands.py   # FinnWoodlands boxes -> YOLO
+│   ├── import_finn_paths.py      # FinnWoodlands "Track" masks -> YOLO-seg polygons
 │   ├── train.py                  # training + dataset validation
 │   ├── evaluate.py               # batch evaluation with/without labels
-│   └── batch_detect.py           # images/folder/video batch inference
+│   ├── batch_detect.py           # images/folder/video batch inference
+│   ├── detect_path.py            # YOLO-seg path isolation + steering offset
+│   └── rugd_segment.py           # pretrained RUGD-Segformer path/tree segmentation
+├── pc_bundle/
+│   ├── train_on_pc.py            # one-command GPU training (Windows or Linux)
+│   ├── requirements.txt          # pins the same Ultralytics as the Jetson
+│   └── README.txt                # step-by-step PC instructions
 ├── tests/
 │   ├── conftest.py               # synthetic fixtures (fixture data only)
 │   ├── test_detector.py
+│   ├── test_infer.py
 │   ├── test_lighting_analysis.py
 │   └── test_evaluation.py
-├── data/                         # images/labels go here (not committed)
-├── models/                       # put checkpoints here (not committed)
-├── outputs/                      # generated outputs (not committed)
-├── reports/                      # evaluation reports & charts (not committed)
-└── runs/                         # training runs (not committed)
+├── data/, data_path/             # datasets (not committed)
+├── models/                       # trained weights / RUGD-Segformer (not committed)
+├── outputs/, reports/, runs/     # generated outputs (not committed)
 ```
 
+---
 ---
 
 ## 11. Testing
 
 ```bash
-.venv/bin/python -m pytest           # 62 tests
+.venv/bin/python -m pytest           # 68 tests
 .venv/bin/python -m pytest -v        # verbose
 ```
 
@@ -403,8 +473,8 @@ pipeline mechanics only and are **not** forestry evaluation data.
 
 **Limitations**
 
-- No trained `tree_trunk` weights and no dataset are bundled; accuracy metrics appear
-  only after you train/evaluate on labeled data.
+- Trained weights and datasets are **not committed** (git-ignored); see Architecture and
+  Section 5 for how to recreate them. Detection accuracy is moderate (see Results) and weak in bright daylight.
 - COCO-pretrained models have no tree class; they run strictly as a labelled baseline.
 - Synthetic lighting variants approximate illumination changes; they do not reproduce
   real sensor response, fog, or directional shadows perfectly.
@@ -414,7 +484,7 @@ pipeline mechanics only and are **not** forestry evaluation data.
 
 | Symptom | Fix |
 |---|---|
-| `No model weights specified` / `Model weights not found` | Put a checkpoint in `models/` or pass `--weights path/to/best.pt` (Model Settings tab). |
+| `No model weights specified` / `Model weights not found` | Put a checkpoint in `models/` or pass `--weights path/to/best.pt` (`--weights` flag). |
 | `The 'ultralytics' package is not installed` | `pip install -r requirements.txt` inside the venv. |
 | GPU listed but inference uses CPU | The app/function probes CUDA with a real kernel test. Generic PyPI torch builds often lack kernels for the local GPU (e.g. Jetson compute capability 8.7) → CPU fallback is intentional. For GPU: install the vendor-matched torch build (e.g. L4T/JetPack wheels), then `python -c "from src.detector import cuda_functional; print(cuda_functional())"` should print `True`. |
 | `Could not open a video writer` | Install ffmpeg or use `--max-frames`; codecs tried: `mp4v, avc1, XVID, MJPG`. |
