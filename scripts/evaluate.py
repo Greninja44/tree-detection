@@ -224,9 +224,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {report.unavailable_reason}")
     print(f"  mean inference : {report.mean_inference_ms} ms  ({report.fps} FPS)")
     for row in report.metrics_table():
+        ms = row["mean_inference_ms"]
+        ms_txt = f"{ms:.3f}" if isinstance(ms, (int, float)) else "n/a"
         print(f"  [{row['lighting_category']}] images={row['images']} "
               f"P={row['precision']} R={row['recall']} mAP50={row['mAP@0.5']} "
-              f"count_MAE={row['count_MAE']} t={row['mean_inference_ms']} ms")
+              f"count_MAE={row['count_MAE']} t={ms_txt} ms")
     print(f"\nReports written to {out}")
     for p in chart_paths:
         print(f"  chart: {p}")

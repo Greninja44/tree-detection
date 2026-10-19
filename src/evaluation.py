@@ -434,8 +434,8 @@ def evaluate_predictions(
             num_images=len(names),
             num_predictions=total_pred,
             num_ground_truth=0,
-            mean_inference_ms=mean_ms,
-            fps=fps,
+            mean_inference_ms=round(mean_ms, 3) if mean_ms else None,
+            fps=round(fps, 2) if fps else None,
             per_image=per_image_rows,
             note=note,
         )
