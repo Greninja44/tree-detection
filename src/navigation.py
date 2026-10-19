@@ -291,11 +291,12 @@ class DirectionSmoother:
     A missing path stops immediately (conservative); resuming needs ``resume_frames`` consecutive valid frames.
     """
 
-    def __init__(self, alpha: float = 0.4, resume_frames: int = 2, config: NavConfig | None = None):
+    def __init__(self, alpha: float = 0.4, resume_frames: int = 2, config: NavConfig | None = None,
+                 start_stopped: bool = True):
         self.alpha, self.resume_frames, self.cfg = alpha, resume_frames, config or NavConfig()
         self._angle: float | None = None
         self._ok = 0
-        self._stopped = True
+        self._stopped = start_stopped  # False for a fresh video: the first valid route is trusted at once
 
     def update(self, direction: Direction) -> Direction:
         if direction.angle_deg is None:

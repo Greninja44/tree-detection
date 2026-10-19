@@ -52,7 +52,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     nav = NavConfig(lookahead=a.lookahead, safety_margin=a.margin, smoothing=a.smoothing, min_confidence=a.min_confidence)
     params = NavParams(conf=a.conf, imgsz=a.imgsz, path_method=a.method, trunk_weights=a.weights, device=a.device, nav=nav)
-    models, smoother = Models(), DirectionSmoother(config=nav)
+    models, smoother = Models(), DirectionSmoother(config=nav, start_stopped=False)
     is_video = src.suffix.lower() in VIDEO_EXT
     rows, lat, prev_pts, writer = [], [], None, None
 

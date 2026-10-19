@@ -1,18 +1,25 @@
-"""GUI: upload a forest image -> tree/obstacle detections + traversable ground + planned local route + direction.
+"""GUI: upload a forest image or video -> tree/obstacle detections + traversable ground + planned local route + direction.
 
     .venv/bin/streamlit run app.py --server.port 8517
 """
+import os
+import tempfile
+import time
+from pathlib import Path
+
 import cv2
 import numpy as np
+import pandas as pd
 import streamlit as st
 
 from src import nav_render
 from src.navigation import NavConfig, STOP
-from src.pipeline import MODELS, PATH_METHODS, Models, ModelUnavailable, NavParams, run_navigation
+from src.pipeline import MODELS, Models, ModelUnavailable, NavParams, available_methods, run_navigation
 from src.traversability import TravConfig
+from src.video_nav import VIDEO_EXT, iter_navigation, video_info, write_webm
 
 st.set_page_config(page_title="Forest Navigation", layout="wide")
-st.title("Forest off-road navigation: trees, traversable ground and local route")
+st.title("Forest off-road navigation: upload an image or video")
 
 
 @st.cache_resource
@@ -26,10 +33,14 @@ with st.sidebar:
     st.header("Settings")
     trunk_w = st.selectbox("Tree detection model", trunk_files,
                            index=trunk_files.index("tree_trunk.pt") if "tree_trunk.pt" in trunk_files else 0) if trunk_files else None
-    method = st.radio("Path segmentation method", PATH_METHODS,
+    method = st.radio("Path segmentation method", available_methods(),
                       format_func=lambda m: {
                           "Terrain-aware (classical + RUGD)": "Terrain-aware (plants + terrain types; not yet evaluated)",
                           "Classical baseline": "Classical baseline (fast, best on trails; no safety veto)",
+                          "Terrain-aware (classical + DeepScene)": "Terrain-aware + DeepScene (safer, fast; plants & terrain)",
+                          "DeepScene FCN": "DeepScene FCN only (trail/grass/vegetation/obstacle)",
+                          "Terrain-aware (classical + ADE20K)": "Terrain-aware + ADE20K (misses snow)",
+                          "ADE20K SegFormer": "ADE20K SegFormer only",
                           "Classical + obstacle veto": "Classical + obstacle veto (safer, needs RUGD, ~5 s)",
                           "RUGD + classical hybrid": "RUGD + classical hybrid (cautious)",
                           "RUGD-Segformer": "RUGD-Segformer only (pretrained)",
@@ -48,16 +59,12 @@ with st.sidebar:
         allow_grass = st.checkbox("Allow driving over grass (at a cost)", True, help="Terrain-aware method only; bushes, water, rocks and trees are always blocked.")
         normalize = st.checkbox("Contrast normalisation (CLAHE) for dark images", True)
 
-up = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
+up = st.file_uploader("Upload an image or a video", type=["jpg", "jpeg", "png"] + [e[1:] for e in VIDEO_EXT])
 if up is None:
-    st.info("Upload a forest image to see tree detections, traversable ground and the planned route.")
+    st.info("Upload a forest image or video to see tree detections, traversable ground, the planned route and obstacle avoidance.")
     st.stop()
 if trunk_w is None:
     st.error("No tree model found. Copy a tree_trunk*.pt file into models/ (see README: Model setup).")
-    st.stop()
-img = cv2.imdecode(np.frombuffer(up.getvalue(), np.uint8), cv2.IMREAD_COLOR)
-if img is None:
-    st.error("Could not read that image (corrupt or unsupported format).")
     st.stop()
 
 params = NavParams(
@@ -66,6 +73,114 @@ params = NavParams(
                   min_confidence=min_conf, min_clearance=clear / 100),
     trav=TravConfig(min_confidence=p_trav, normalize_lighting=normalize),
 )
+rgb = lambda a: cv2.cvtColor(a, cv2.COLOR_BGR2RGB)  # noqa: E731
+
+
+def small(img: np.ndarray, w: int = 640) -> np.ndarray:
+    return cv2.resize(img, (w, max(1, int(img.shape[0] * w / img.shape[1]))), interpolation=cv2.INTER_AREA)
+
+
+def render_video(upload) -> None:
+    """Process a video: progress bar, annotated clip, frame explorer, charts, downloads."""
+    st.subheader("Video navigation")
+    c1, c2 = st.columns(2)
+    stride = c1.slider("Process every Nth frame", 1, 15, 3, help="Higher = faster; the route is smoothed across processed frames.")
+    max_frames = c2.slider("Maximum frames to process", 10, 300, 60, 10)
+    suffix = Path(upload.name).suffix.lower()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(upload.getvalue())
+        path = tmp.name
+    try:
+        try:
+            info = video_info(path)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        n_proc = min(max_frames, max(1, -(-info.frames // stride))) if info.frames > 0 else max_frames
+        st.caption(f"{info.width}x{info.height}, {info.fps:.1f} fps, {info.frames} frames -> about {n_proc} frames to process "
+                   f"(method: {method}). Estimated time depends on the method: ~0.3 s/frame classical, ~5 s/frame with RUGD on the Jetson CPU.")
+        key = (upload.name, upload.size, repr(params), stride, max_frames)
+        if st.session_state.get("video_key") != key:
+            st.session_state.pop("video_result", None)
+        if "video_result" not in st.session_state:
+            if not st.button("Process video", type="primary"):
+                return
+            bar, txt = st.progress(0.0), st.empty()
+            rows, panels, navs, t0 = [], [], [], time.perf_counter()
+            try:
+                for n, (idx, frame, out) in enumerate(iter_navigation(path, models(), params, stride, max_frames), 1):
+                    nav_img = nav_render.draw_navigation(frame, out.trav, out.plan, out.direction)
+                    det_img = nav_render.draw_detections(frame, out.boxes, out.trav, out.plants)
+                    panels.append((small(frame), small(det_img), small(nav_img)))
+                    navs.append(small(nav_img, 960))
+                    m = out.metrics
+                    rows.append({"frame": idx, "time_s": round(idx / info.fps, 2), "trunks": len(out.boxes),
+                                 "direction": out.direction.label if out.direction else "OFF",
+                                 "angle_deg": None if not out.direction or out.direction.angle_deg is None else round(out.direction.angle_deg, 1),
+                                 "path_coverage_pct": round(m.get("path_coverage_pct", 0.0), 1), "route_confidence": round(m.get("path_confidence", 0.0), 2),
+                                 "route": bool(m.get("continuous_route")), "latency_s": round(out.timings["total_s"], 2),
+                                 "stop_reason": m.get("stop_reason", "")})
+                    bar.progress(min(1.0, n / max(1, n_proc)))
+                    txt.caption(f"frame {n}/{n_proc} · {rows[-1]['direction']} · {n / (time.perf_counter() - t0):.2f} fps so far")
+            except ModelUnavailable as exc:
+                st.error(f"Model problem: {exc}")
+                return
+            except Exception as exc:
+                st.error(f"Processing failed: {type(exc).__name__}: {exc}")
+                return
+            bar.empty()
+            txt.empty()
+            if not rows:
+                st.error("No frames could be read from this video.")
+                return
+            out_fps = max(1.0, info.fps / stride)
+            webm = None
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as wf:
+                wpath = wf.name
+            if write_webm(navs, wpath, out_fps):
+                webm = Path(wpath).read_bytes()
+            os.unlink(wpath)
+            st.session_state.update(video_key=key, video_result={"rows": rows, "panels": panels, "webm": webm, "fps": out_fps,
+                                                                 "elapsed": time.perf_counter() - t0})
+        res = st.session_state["video_result"]
+    finally:
+        os.unlink(path)
+
+    df = pd.DataFrame(res["rows"])
+    ok = df["route"].mean()
+    k = st.columns(4)
+    k[0].metric("Frames processed", len(df))
+    k[1].metric("Frames with a safe route", f"{ok:.0%}")
+    k[2].metric("STOP frames", int((df["direction"] == STOP).sum()))
+    k[3].metric("Measured speed", f"{len(df) / res['elapsed']:.2f} fps")
+    if res["webm"]:
+        st.video(res["webm"], format="video/webm")
+        st.download_button("Download annotated video (WebM)", res["webm"], "navigation.webm", "video/webm")
+    else:
+        st.warning("This machine's OpenCV cannot encode WebM; use the frame viewer below and the CSV.")
+    i = st.slider("Frame viewer", 1, len(df), 1)
+    row = df.iloc[i - 1]
+    st.caption(f"Source frame {int(row['frame'])} ({row['time_s']} s) · {row['direction']} · coverage {row['path_coverage_pct']:.0f}% · "
+               f"confidence {row['route_confidence']:.2f}" + (f" · {row['stop_reason']}" if row["stop_reason"] else ""))
+    a, b, c = st.columns(3)
+    a.image(rgb(res["panels"][i - 1][0]), caption="Original", width="stretch")
+    b.image(rgb(res["panels"][i - 1][1]), caption="Plants, trees & obstacles", width="stretch")
+    c.image(rgb(res["panels"][i - 1][2]), caption="Navigation", width="stretch")
+    st.line_chart(df.set_index("frame")[["angle_deg", "path_coverage_pct"]])
+    st.caption("Heading angle (+ = right, gaps = STOP) and path coverage over the processed frames.")
+    with st.expander("Per-frame table"):
+        st.dataframe(df, width="stretch")
+    st.download_button("Download per-frame CSV", df.to_csv(index=False).encode(), "navigation.csv", "text/csv")
+
+
+if Path(up.name).suffix.lower() in VIDEO_EXT:
+    render_video(up)
+    st.stop()
+
+img = cv2.imdecode(np.frombuffer(up.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+if img is None:
+    st.error("Could not read that image (corrupt or unsupported format).")
+    st.stop()
 try:
     with st.spinner("Running detection and navigation..."):
         out = run_navigation(img, models(), params)
@@ -76,7 +191,6 @@ except Exception as exc:  # inference failure: report, never fake a path
     st.error(f"Inference failed: {type(exc).__name__}: {exc}")
     st.stop()
 
-rgb = lambda a: cv2.cvtColor(a, cv2.COLOR_BGR2RGB)  # noqa: E731
 if method == "Off":
     st.warning("Path method is Off: navigation is disabled. Only tree detection is shown.")
 

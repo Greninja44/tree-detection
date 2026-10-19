@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src import infer  # noqa: E402
 from src.navigation import estimate_navigation_direction, path_coverage, plan_local_path  # noqa: E402
-from src.pipeline import HYBRID, TERRAIN, VETO, Models, NavParams, resolve_device  # noqa: E402
+from src.pipeline import ADE, DEEPSCENE, HYBRID, TERRAIN, TERRAIN_ADE, TERRAIN_DEEPSCENE, VETO, Models, NavParams, resolve_device  # noqa: E402
 from src.traversability import SegOutput, detect_traversable_region  # noqa: E402
 
 SIDE = lambda a, dead: "S" if abs(a) <= dead else ("R" if a > 0 else "L")  # noqa: E731
@@ -45,13 +45,14 @@ def cached_seg(models, params, device, img, key, cache: Path):
     if params.path_method == HYBRID:
         base = cached_seg(models, NavParams(path_method="RUGD-Segformer", imgsz=params.imgsz, device=params.device), device, img, key, cache)
         return fuse_segmentations(base, segment_classical(norm, params.trav))
-    if params.path_method == TERRAIN:
-        base = cached_seg(models, NavParams(path_method="RUGD-Segformer", imgsz=params.imgsz, device=params.device), device, img, key, cache)
+    fused = {TERRAIN: "RUGD-Segformer", TERRAIN_DEEPSCENE: DEEPSCENE, TERRAIN_ADE: ADE}
+    if params.path_method in fused:
+        base = cached_seg(models, NavParams(path_method=fused[params.path_method], imgsz=params.imgsz, device=params.device), device, img, key, cache)
         return fuse_terrain_aware(base, segment_classical(norm, params.trav), params.allow_grass)
     if params.path_method == VETO:
         base = cached_seg(models, NavParams(path_method="RUGD-Segformer", imgsz=params.imgsz, device=params.device), device, img, key, cache)
         return fuse_obstacle_veto(base, segment_classical(norm, params.trav))
-    f = cache / f"seg_{params.path_method[:4]}_{params.imgsz}_{key}.npz"
+    f = cache / f"seg_{params.path_method.split()[0][:6]}_{params.imgsz}_{key}.npz"
     if f.exists():
         z = np.load(f, allow_pickle=True)
         names = {int(k): v for k, v in z["names"].item().items()} if "names" in z.files else None

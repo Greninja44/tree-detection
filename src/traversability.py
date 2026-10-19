@@ -130,18 +130,43 @@ def start_region_mask(shape: tuple[int, int], band: tuple[float, float, float] =
     return m
 
 
-def make_rugd_segmenter(model, imgsz: int = 480, device: str = "cpu") -> Segmenter:
-    """Wrap a loaded ``SegformerForSemanticSegmentation`` (RUGD) as a :data:`Segmenter`."""
+@dataclass(frozen=True)
+class ClassGroups:
+    """Which label names of a semantic model map to each navigation class (matched on the name before any comma)."""
+    traversable: frozenset
+    vegetation: frozenset
+    obstacle: frozenset
+    sky: frozenset
+    traversable_weights: tuple = ()  # ((name, weight), ...) partial credit, e.g. grass passable at lower confidence
+
+
+RUGD_GROUPS = ClassGroups(frozenset(RUGD_TRAVERSABLE), frozenset(RUGD_VEGETATION), frozenset(RUGD_OBSTACLE), frozenset(RUGD_SKY))
+# ADE20K (150 classes, SegFormer): bare ground / paths are traversable, plants/grass are vegetation, "mountain"/"hill" stay unknown.
+ADE_GROUPS = ClassGroups(
+    frozenset({"path", "dirt track", "earth", "sand", "road", "sidewalk", "floor"}),
+    frozenset({"grass", "plant", "field", "flower"}),
+    frozenset({"tree", "rock", "water", "wall", "building", "fence", "person", "car", "pole", "streetlight", "boat", "bus",
+               "truck", "van", "bicycle", "animal", "stairs", "hovel", "bench", "table", "chair", "sign", "signboard", "stone"}),
+    frozenset({"sky"}),
+)
+# DeepScene (Freiburg Forest): trail is the drivable path, grass is passable at a cost.
+DEEPSCENE_NAMES = {0: "trail", 1: "grass", 2: "vegetation", 3: "obstacle", 4: "sky"}
+
+
+def make_segformer_segmenter(model, imgsz: int = 480, device: str = "cpu", groups: ClassGroups = RUGD_GROUPS,
+                             method: str = "RUGD-Segformer", note: str = "") -> Segmenter:
+    """Wrap a loaded Hugging Face ``SegformerForSemanticSegmentation`` as a :data:`Segmenter`."""
     import torch
 
     id2label = {int(k): v for k, v in model.config.id2label.items()}
+    short = {i: v.split(",")[0].strip() for i, v in id2label.items()}
     n = max(id2label) + 1
     cls_of = np.full(n, UNKNOWN, np.uint8)
-    for i, name in id2label.items():
-        cls_of[i] = (TRAVERSABLE if name in RUGD_TRAVERSABLE else VEGETATION if name in RUGD_VEGETATION
-                     else OBSTACLE if name in RUGD_OBSTACLE else UNKNOWN)
-    trav_ids = [i for i, nme in id2label.items() if nme in RUGD_TRAVERSABLE]
-    sky_ids = [i for i, nme in id2label.items() if nme in RUGD_SKY]
+    for i, name in short.items():
+        cls_of[i] = (TRAVERSABLE if name in groups.traversable else VEGETATION if name in groups.vegetation
+                     else OBSTACLE if name in groups.obstacle else UNKNOWN)
+    trav_ids = [i for i, nme in short.items() if nme in groups.traversable]
+    sky_ids = [i for i, nme in short.items() if nme in groups.sky]
     mean = np.array([0.485, 0.456, 0.406], np.float32)
     std = np.array([0.229, 0.224, 0.225], np.float32)
     cfg = TravConfig()
@@ -165,11 +190,55 @@ def make_rugd_segmenter(model, imgsz: int = 480, device: str = "cpu") -> Segment
             classes=up(classes, cv2.INTER_NEAREST),
             p_trav=np.clip(up(p_trav, cv2.INTER_LINEAR), 0, 1),
             valid=~up(sky.astype(np.uint8), cv2.INTER_NEAREST).astype(bool),
-            method="RUGD-Segformer",
-            notes=["Pretrained on RUGD off-road imagery; not validated on this camera or forest."],
+            method=method,
+            notes=[note or f"{method}: pretrained semantic model; not validated on this camera or forest."],
             labels=up(arg.astype(np.uint8), cv2.INTER_NEAREST),
-            label_names=id2label,
+            label_names=short,
         )
+
+    return run
+
+
+def make_rugd_segmenter(model, imgsz: int = 480, device: str = "cpu") -> Segmenter:
+    """RUGD-Segformer (off-road imagery, 25 classes) as a :data:`Segmenter`."""
+    return make_segformer_segmenter(model, imgsz, device, RUGD_GROUPS, "RUGD-Segformer",
+                                    "Pretrained on RUGD off-road imagery; not validated on this camera or forest.")
+
+
+def make_ade_segmenter(model, imgsz: int = 512, device: str = "cpu") -> Segmenter:
+    """SegFormer fine-tuned on ADE20K (150 classes incl. path, dirt track, earth, sand, grass, plant, tree, rock, water)."""
+    return make_segformer_segmenter(model, imgsz, device, ADE_GROUPS, "ADE20K SegFormer",
+                                    "ADE20K SegFormer (NVIDIA non-commercial license): generic scene model, not off-road specific.")
+
+
+def make_deepscene_segmenter(onnx_path: str, grass_weight: float = 0.6) -> Segmenter:
+    """NVIDIA jetson-inference FCN-ResNet18-DeepScene (576x320): trail / grass / vegetation / obstacle / sky.
+
+    Runs with OpenCV's DNN module (no extra dependency).  The raw output is a coarse 10x18 grid, so class
+    probabilities are upsampled bilinearly.  P(traversable) = P(trail) + grass_weight * P(grass).
+    """
+    net = cv2.dnn.readNetFromONNX(str(onnx_path))
+    mean = np.array([0.485, 0.456, 0.406], np.float32)
+    std = np.array([0.229, 0.224, 0.225], np.float32)
+    cls_of = np.array([TRAVERSABLE, VEGETATION, VEGETATION, OBSTACLE, UNKNOWN], np.uint8)
+
+    def run(image: np.ndarray) -> SegOutput:
+        validate_image(image)
+        H, W = image.shape[:2]
+        x = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), (576, 320)).astype(np.float32) / 255.0
+        net.setInput(((x - mean) / std).transpose(2, 0, 1)[None].astype(np.float32))
+        logits = net.forward()[0]  # (5, 10, 18)
+        e = np.exp(logits - logits.max(0, keepdims=True))
+        prob = e / e.sum(0, keepdims=True)
+        up_p = np.stack([cv2.resize(c, (W, H), interpolation=cv2.INTER_LINEAR) for c in prob])  # (5, H, W)
+        arg = up_p.argmax(0)
+        classes = cls_of[arg]
+        classes[up_p.max(0) < TravConfig().unknown_confidence] = UNKNOWN
+        p_trav = np.clip(up_p[0] + grass_weight * up_p[1], 0, 1).astype(np.float32)
+        sky = arg == 4
+        sky[int(0.45 * H):] = False
+        return SegOutput(classes, p_trav, ~sky, "DeepScene FCN", ["DeepScene FCN-ResNet18 (Freiburg Forest trails): summer-forest trained, coarse output."],
+                         arg.astype(np.uint8), DEEPSCENE_NAMES)
 
     return run
 
@@ -273,7 +342,8 @@ def fuse_obstacle_veto(primary: SegOutput, baseline: SegOutput) -> SegOutput:
 
 # Terrain-aware passability: RUGD labels that are never ground, and labels that are passable only with caution.
 TERRAIN_BLOCKED = {"bush", "water", "tree", "log", "rock", "pole", "fence", "building", "vehicle", "person", "bicycle",
-                   "container/generic-object", "sign", "picnic-table"}
+                   "container/generic-object", "sign", "picnic-table",          # RUGD
+                   "vegetation", "obstacle", "plant", "wall", "car", "stone"}   # DeepScene / ADE20K
 TERRAIN_CAUTION = {"grass": 0.75, "rock-bed": 0.55}  # score multiplier: passable but costlier / less certain
 PLANT_LABELS = ("tree", "bush", "grass", "log")
 
@@ -315,7 +385,7 @@ def plant_detections(result: TraversabilityResult, min_area_fraction: float = 0.
     """Plants and terrain found in the image.
 
     Returns ``{"summary": {label: % of valid pixels}, "bushes": [(x0, y0, x1, y1, area_fraction)], "source": str}``.
-    With a pretrained terrain model the labels are its own (grass, bush, tree, log ...); without one only an
+    With a pretrained terrain model the labels are its own (e.g. grass, bush, tree, log or DeepScene's trail/grass/vegetation/obstacle); without one only an
     *approximate* ``vegetation`` share is available (green, textured pixels from the classical estimator).
     """
     valid = result.valid
@@ -340,7 +410,7 @@ def plant_detections(result: TraversabilityResult, min_area_fraction: float = 0.
             if frac >= min_area_fraction:
                 x, y, w, h = (int(st[j, c]) for c in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
                 bushes.append((x, y, x + w, y + h, float(frac)))
-    return {"summary": dict(sorted(summary.items(), key=lambda kv: -kv[1])), "bushes": bushes, "source": "RUGD-Segformer"}
+    return {"summary": dict(sorted(summary.items(), key=lambda kv: -kv[1])), "bushes": bushes, "source": result.method}
 
 
 def make_veto_segmenter(primary: Segmenter) -> Segmenter:
