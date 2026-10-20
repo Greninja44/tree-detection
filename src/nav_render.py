@@ -27,7 +27,7 @@ def _text(img, text, org, scale=0.55, color=WHITE, thick=1, bg=True):
 
 
 TERRAIN_COLORS = {"grass": (80, 230, 120), "bush": (200, 60, 220), "tree": (40, 140, 40), "log": (0, 140, 255),
-                  "rock": (0, 140, 255), "rock-bed": (0, 170, 255), "water": (230, 140, 30)}
+                  "rock": (0, 140, 255), "rock-bed": (0, 170, 255), "water": (230, 140, 30), "person": (0, 0, 255), "vehicle": (0, 0, 255)}
 
 
 def draw_detections(image: np.ndarray, boxes: Sequence[Sequence[float]], trav: TraversabilityResult | None = None,

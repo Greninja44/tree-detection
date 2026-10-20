@@ -20,6 +20,13 @@ import cv2
 import numpy as np
 
 STOP = "STOP / NO SAFE PATH"
+# Structured STOP reason codes (PathPlan.reason_code)
+NO_TRAVERSABLE_REGION = "NO_TRAVERSABLE_REGION"              # no ground classified traversable where the route must start
+OBSTACLE_BLOCKS_CORRIDOR = "OBSTACLE_BLOCKS_CORRIDOR"        # a corridor exists until obstacles / safety margins cut it
+LOW_CONFIDENCE_TERRAIN = "LOW_CONFIDENCE_TERRAIN"            # a route exists but its terrain confidence is below the minimum
+INSUFFICIENT_CORRIDOR_WIDTH = "INSUFFICIENT_CORRIDOR_WIDTH"  # ground exists but is narrower than the minimum corridor
+NO_VALID_CONNECTED_CORRIDOR = "NO_VALID_CONNECTED_CORRIDOR"  # ground is fragmented: nothing connects the start to the look-ahead
+STOP_CODES = (NO_TRAVERSABLE_REGION, OBSTACLE_BLOCKS_CORRIDOR, LOW_CONFIDENCE_TERRAIN, INSUFFICIENT_CORRIDOR_WIDTH, NO_VALID_CONNECTED_CORRIDOR)
 DIRECTIONS = ("TURN LEFT", "SLIGHT LEFT", "STRAIGHT", "SLIGHT RIGHT", "TURN RIGHT", STOP)
 
 
@@ -61,6 +68,7 @@ class PathPlan:
     continuous: bool                       # a continuous route start -> look-ahead exists
     partial: bool = False                  # route reaches only part of the look-ahead distance (ground ends early)
     reached_fraction: float = 0.0          # fraction of the look-ahead distance the route reaches
+    reason_code: str = ""                  # machine-readable STOP cause, see STOP_CODES
     candidate_points: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), np.float32))
 
 
@@ -92,10 +100,10 @@ def path_coverage(traversable: np.ndarray, valid: np.ndarray | None = None, roi_
     return cov, area
 
 
-def _fail(shape, reason, start_xy, blocked, candidate=None, continuous=False, target=None) -> PathPlan:
+def _fail(shape, reason, start_xy, blocked, candidate=None, continuous=False, target=None, code="") -> PathPlan:
     return PathPlan(False, np.zeros((0, 2), np.float32), np.zeros(shape, bool), blocked, 0.0, 0.0, reason,
                     start_xy, target, continuous,
-                    candidate_points=candidate if candidate is not None else np.zeros((0, 2), np.float32))
+                    candidate_points=candidate if candidate is not None else np.zeros((0, 2), np.float32), reason_code=code)
 
 
 def _dijkstra(cost: np.ndarray, passable: np.ndarray, starts: list[tuple[int, int, float]]):
@@ -181,6 +189,9 @@ def plan_local_path(traversable: np.ndarray, obstacles: np.ndarray, config: NavC
     clear = cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2, 3)
     min_clear = max(1.0, cfg.min_clearance * gw)
     passable = free & (clear >= min_clear)
+    # Same ground ignoring obstacles/margins: distinguishes "blocked by obstacles" from "no ground / too narrow / fragmented".
+    clear0 = cv2.distanceTransform(trav.astype(np.uint8), cv2.DIST_L2, 3)
+    passable0 = trav & (clear0 >= min_clear)
 
     sy = min(gh - 1, int(round(cfg.start_y * gh)))
     cx = cfg.start_x * gw
@@ -193,10 +204,12 @@ def plan_local_path(traversable: np.ndarray, obstacles: np.ndarray, config: NavC
     goal_row = max(0, int(round(sy - cfg.lookahead * gh)))
     target_xy = (cfg.start_x * W, (goal_row + 0.5) * H / gh)
     if not free[sy0:sy + 1, sx0:sx1].any():
-        return _fail((H, W), "No traversable, unblocked ground near the start position.", start_xy, blocked_full, target=target_xy)
+        code = OBSTACLE_BLOCKS_CORRIDOR if trav[sy0:sy + 1, sx0:sx1].any() else NO_TRAVERSABLE_REGION
+        return _fail((H, W), "No traversable, unblocked ground near the start position.", start_xy, blocked_full, target=target_xy, code=code)
     if not starts:
+        code = OBSTACLE_BLOCKS_CORRIDOR if passable0[sy0:sy + 1, sx0:sx1].any() else INSUFFICIENT_CORRIDOR_WIDTH
         return _fail((H, W), "Ground near the start position is too narrow or too close to obstacles.", start_xy,
-                     blocked_full, target=target_xy)
+                     blocked_full, target=target_xy, code=code)
 
     prob = down(p_trav) if p_trav is not None else np.full((gh, gw), 0.7, np.float32)
     lateral = np.abs(np.arange(gw)[None, :] + 0.5 - cx) / gw
@@ -211,8 +224,13 @@ def plan_local_path(traversable: np.ndarray, obstacles: np.ndarray, config: NavC
         i = int(ys.argmin())
         raw = np.array([to_px(c) for c in _backtrace(prev, gw, int(ys[i]), int(xs[i]))], np.float32)
         top = f"{100 * (1 - raw[-1, 1] / H):.0f}%"
+        n_cc, lbl0 = cv2.connectedComponents(passable0.astype(np.uint8), connectivity=8)
+        need_row = sy - cfg.min_reach * need
+        start_cc = {int(lbl0[y, x]) for y in range(sy0, sy + 1) for x in range(sx0, sx1) if passable0[y, x]}
+        ys0, xs0 = np.nonzero(np.isin(lbl0, list(start_cc)) & (np.arange(gh)[:, None] <= need_row)) if start_cc else (np.array([]), np.array([]))
+        code = OBSTACLE_BLOCKS_CORRIDOR if len(ys0) else NO_VALID_CONNECTED_CORRIDOR
         return _fail((H, W), f"No continuous safe corridor reaches the look-ahead point (route stops at {top} image height).",
-                     start_xy, blocked_full, candidate=raw, continuous=False, target=target_xy)
+                     start_xy, blocked_full, candidate=raw, continuous=False, target=target_xy, code=code)
     # Score every sufficiently-far endpoint: path cost + a penalty for the look-ahead distance left unreached, so a
     # slightly shorter route near the vehicle's heading beats a full-length one far off to the side.
     score = dist[ys, xs] + cfg.k_goal * np.maximum(0, ys - goal_row)
@@ -242,7 +260,7 @@ def plan_local_path(traversable: np.ndarray, obstacles: np.ndarray, config: NavC
     corridor = (corridor > 0) & ~blocked_full & traversable
     if conf < cfg.min_confidence:
         return _fail((H, W), f"Route confidence {conf:.2f} is below the minimum {cfg.min_confidence:.2f}.", start_xy,
-                     blocked_full, candidate=pts, continuous=True, target=target_xy)
+                     blocked_full, candidate=pts, continuous=True, target=target_xy, code=LOW_CONFIDENCE_TERRAIN)
     return PathPlan(True, pts, corridor, blocked_full, conf, clearance_px, "", start_xy, tuple(map(float, pts[-1])),
                     True, partial, reach)
 

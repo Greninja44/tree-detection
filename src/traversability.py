@@ -62,6 +62,10 @@ class SegOutput:
     notes: list[str] = field(default_factory=list)
     labels: np.ndarray | None = None          # (H, W) uint8 fine terrain id (e.g. RUGD: grass, bush, dirt ...) or None
     label_names: dict[int, str] | None = None
+    p_block: np.ndarray | None = None         # (H, W) float32 P(obstacle or dense vegetation) for soft vetoes, or None
+    p_obstacle: np.ndarray | None = None      # (H, W) float32 P(confirmed obstacle class) or None
+    p_vegetation: np.ndarray | None = None    # (H, W) float32 P(dense-vegetation class) or None
+    p_cost: np.ndarray | None = None          # (H, W) float32 route-cost confidence (decision probability x caution); planner only
 
 
 @dataclass
@@ -77,6 +81,7 @@ class TraversabilityResult:
     notes: list[str] = field(default_factory=list)
     labels: np.ndarray | None = None
     label_names: dict[int, str] | None = None
+    p_decision: np.ndarray | None = None      # eligibility probability (what was thresholded); p_trav is the planner-cost map
 
 
 Segmenter = Callable[[np.ndarray], SegOutput]
@@ -138,9 +143,12 @@ class ClassGroups:
     obstacle: frozenset
     sky: frozenset
     traversable_weights: tuple = ()  # ((name, weight), ...) partial credit, e.g. grass passable at lower confidence
+    dense_vegetation: frozenset = frozenset()  # subset of `vegetation` counted in P(vegetation); empty = all of `vegetation`
 
 
-RUGD_GROUPS = ClassGroups(frozenset(RUGD_TRAVERSABLE), frozenset(RUGD_VEGETATION), frozenset(RUGD_OBSTACLE), frozenset(RUGD_SKY))
+# RUGD: grass is passable (with caution), bushes are the dense vegetation that blocks.
+RUGD_GROUPS = ClassGroups(frozenset(RUGD_TRAVERSABLE), frozenset(RUGD_VEGETATION), frozenset(RUGD_OBSTACLE), frozenset(RUGD_SKY),
+                          dense_vegetation=frozenset({"bush"}))
 # ADE20K (150 classes, SegFormer): bare ground / paths are traversable, plants/grass are vegetation, "mountain"/"hill" stay unknown.
 ADE_GROUPS = ClassGroups(
     frozenset({"path", "dirt track", "earth", "sand", "road", "sidewalk", "floor"}),
@@ -167,6 +175,8 @@ def make_segformer_segmenter(model, imgsz: int = 480, device: str = "cpu", group
                      else OBSTACLE if name in groups.obstacle else UNKNOWN)
     trav_ids = [i for i, nme in short.items() if nme in groups.traversable]
     sky_ids = [i for i, nme in short.items() if nme in groups.sky]
+    block_ids = [i for i, nme in short.items() if nme in groups.obstacle]
+    veg_ids = [i for i, nme in short.items() if nme in (groups.dense_vegetation or groups.vegetation)]
     mean = np.array([0.485, 0.456, 0.406], np.float32)
     std = np.array([0.229, 0.224, 0.225], np.float32)
     cfg = TravConfig()
@@ -183,6 +193,7 @@ def make_segformer_segmenter(model, imgsz: int = 480, device: str = "cpu", group
         classes = cls_of[arg]
         classes[top < cfg.unknown_confidence] = UNKNOWN
         p_trav = prob[trav_ids].sum(0).astype(np.float32)
+        p_block = prob[block_ids].sum(0).astype(np.float32)
         sky = np.isin(arg, sky_ids)
         sky[int(0.45 * sky.shape[0]):] = False  # "sky" low in the frame is more likely snow/bright ground: unknown, not invalid
         up = lambda a, interp: cv2.resize(a, (W, H), interpolation=interp)  # noqa: E731
@@ -194,6 +205,9 @@ def make_segformer_segmenter(model, imgsz: int = 480, device: str = "cpu", group
             notes=[note or f"{method}: pretrained semantic model; not validated on this camera or forest."],
             labels=up(arg.astype(np.uint8), cv2.INTER_NEAREST),
             label_names=short,
+            p_block=np.clip(up(p_block, cv2.INTER_LINEAR), 0, 1),
+            p_obstacle=np.clip(up(p_block, cv2.INTER_LINEAR), 0, 1),
+            p_vegetation=np.clip(up(prob[veg_ids].sum(0).astype(np.float32), cv2.INTER_LINEAR), 0, 1),
         )
 
     return run
@@ -237,8 +251,10 @@ def make_deepscene_segmenter(onnx_path: str, grass_weight: float = 0.6) -> Segme
         p_trav = np.clip(up_p[0] + grass_weight * up_p[1], 0, 1).astype(np.float32)
         sky = arg == 4
         sky[int(0.45 * H):] = False
+        p_block = np.clip(up_p[2] + up_p[3], 0, 1).astype(np.float32)  # dense vegetation + obstacle
         return SegOutput(classes, p_trav, ~sky, "DeepScene FCN", ["DeepScene FCN-ResNet18 (Freiburg Forest trails): summer-forest trained, coarse output."],
-                         arg.astype(np.uint8), DEEPSCENE_NAMES)
+                         arg.astype(np.uint8), DEEPSCENE_NAMES, p_block, np.clip(up_p[3], 0, 1).astype(np.float32),
+                         np.clip(up_p[2], 0, 1).astype(np.float32))
 
     return run
 
@@ -348,19 +364,28 @@ TERRAIN_CAUTION = {"grass": 0.75, "rock-bed": 0.55}  # score multiplier: passabl
 PLANT_LABELS = ("tree", "bush", "grass", "log")
 
 
-def fuse_terrain_aware(primary: SegOutput, baseline: SegOutput, allow_grass: bool = True) -> SegOutput:
+def fuse_terrain_aware(primary: SegOutput, baseline: SegOutput, allow_grass: bool = True,
+                       veto_threshold: float | None = None) -> SegOutput:
     """Terrain-aware ground: union of the classical estimate and the pretrained ground classes, minus what the
     pretrained model says cannot be driven over (obstacles, bushes, water, rocks, ...).
 
     Grass and rock-bed stay passable at reduced confidence (so routes prefer dirt/gravel/sand/mulch but can cross
     grass); with ``allow_grass=False`` grass is blocked.  The classical estimate covers ground the pretrained
     model does not know (e.g. snow).  Needs ``primary.labels``; otherwise falls back to the plain obstacle veto.
+
+    ``veto_threshold`` makes the veto *soft*: when the primary provides ``p_block`` (P of obstacle/dense vegetation),
+    a pixel is blocked only where ``p_block >= veto_threshold`` instead of wherever blocked classes win the argmax.
+    A higher threshold keeps more ground that the primary is unsure about (fewer false stops, e.g. on leaf litter)
+    at the price of a weaker veto.
     """
     if primary.labels is None or primary.label_names is None:
         return fuse_obstacle_veto(primary, baseline)
     names = primary.label_names
     ids = lambda group: [i for i, n in names.items() if n in group]  # noqa: E731
-    blocked = np.isin(primary.labels, ids(TERRAIN_BLOCKED)) | (primary.classes == OBSTACLE)
+    if veto_threshold is not None and primary.p_block is not None:
+        blocked = primary.p_block >= veto_threshold
+    else:
+        blocked = np.isin(primary.labels, ids(TERRAIN_BLOCKED)) | (primary.classes == OBSTACLE)
     scale = np.ones(primary.labels.shape, np.float32)
     for name, mult in TERRAIN_CAUTION.items():
         scale[np.isin(primary.labels, ids({name}))] = mult
@@ -377,8 +402,79 @@ def fuse_terrain_aware(primary: SegOutput, baseline: SegOutput, allow_grass: boo
     return SegOutput(classes, p, primary.valid, "Terrain-aware (classical + RUGD)", notes, primary.labels, names)
 
 
-def make_terrain_segmenter(primary: Segmenter, allow_grass: bool = True) -> Segmenter:
-    return lambda image: fuse_terrain_aware(primary(image), segment_classical(image), allow_grass)
+def fuse_confidence_aware(primary: SegOutput, baseline: SegOutput, allow_grass: bool = True,
+                          obstacle_threshold: float = 0.5, veg_weight: float = 1.0) -> SegOutput:
+    """Classical-led ground with a confidence-weighted vegetation penalty and a *separate* hard obstacle rule.
+
+    * ``p_decision = max(0.9 * classical, primary ground) * (1 - veg_weight * P(vegetation))`` is what gets thresholded.
+      ``veg_weight = 1`` blocks ground the model calls vegetation; smaller values trade safety for fewer false stops.
+    * Hard OBSTACLE (with the planner's safety margin) only where ``P(obstacle) >= obstacle_threshold`` - confirmed
+      evidence.  Vegetation-vetoed or unsure pixels are merely not eligible (class VEGETATION / UNKNOWN), no margin.
+    * Caution for grass / rock-bed lowers only the planner's *cost* confidence (``p_cost``), never eligibility.
+    Needs ``primary.p_obstacle`` / ``p_vegetation``; otherwise falls back to :func:`fuse_terrain_aware`.
+    """
+    if primary.p_obstacle is None or primary.p_vegetation is None:
+        return fuse_terrain_aware(primary, baseline, allow_grass)
+    base = np.maximum(baseline.p_trav * 0.9, primary.p_trav)
+    p_dec = (base * (1.0 - veg_weight * primary.p_vegetation)).astype(np.float32)
+    hard = primary.p_obstacle >= obstacle_threshold
+    scale = np.ones(p_dec.shape, np.float32)
+    if primary.labels is not None and primary.label_names is not None:
+        for name, mult in TERRAIN_CAUTION.items():
+            ids_ = [i for i, n in primary.label_names.items() if n == name]
+            if ids_:
+                scale[np.isin(primary.labels, ids_)] = mult
+        if not allow_grass:
+            g_ = [i for i, n in primary.label_names.items() if n == "grass"]
+            if g_:
+                p_dec[np.isin(primary.labels, g_)] = 0.0
+    p_dec[hard] = 0.0
+    classes = np.full(p_dec.shape, UNKNOWN, np.uint8)
+    classes[primary.classes == VEGETATION] = VEGETATION
+    classes[p_dec >= 0.5] = TRAVERSABLE
+    classes[hard] = OBSTACLE
+    notes = list(primary.notes) + [f"Confidence-aware fusion (veg weight {veg_weight}, obstacle threshold {obstacle_threshold}): hard obstacles "
+                                   "only from confirmed obstacle evidence; vegetation lowers ground confidence; grass caution affects route cost only."] + list(baseline.notes)
+    return SegOutput(classes, p_dec, primary.valid, "Confidence-aware (classical + " + primary.method + ")", notes, primary.labels, primary.label_names,
+                     p_cost=(p_dec * scale).astype(np.float32))
+
+
+def fuse_multi_source(rugd: SegOutput, deepscene: SegOutput, baseline: SegOutput, allow_grass: bool = True,
+                      obstacle_threshold: float = 0.5, bush_threshold: float = 0.5) -> SegOutput:
+    """Ground = union of evidence; hard veto = any source that confirms an obstacle.
+
+    Ground eligibility: ``max(0.9 * classical, RUGD ground, DeepScene trail)``.  Hard OBSTACLE (with margin) where RUGD's obstacle
+    group (trees, people, vehicles, logs, rocks, water ...) or DeepScene's obstacle class has P >= ``obstacle_threshold``, or RUGD's
+    *bush* class has P >= ``bush_threshold``.  DeepScene's "vegetation" is deliberately NOT a veto (it labels leaf litter that way).
+    Grass / rock-bed stay passable at a higher route cost (RUGD labels).  Trunk and hazard-detector footprints are added by the caller.
+    """
+    p_ground = np.maximum.reduce([baseline.p_trav * 0.9, rugd.p_trav, deepscene.p_trav]).astype(np.float32)
+    hard = (rugd.p_obstacle >= obstacle_threshold) | (deepscene.p_obstacle >= obstacle_threshold) | (rugd.p_vegetation >= bush_threshold)
+    scale = np.ones(p_ground.shape, np.float32)
+    if rugd.labels is not None and rugd.label_names is not None:
+        for name, mult in TERRAIN_CAUTION.items():
+            ids_ = [i for i, n in rugd.label_names.items() if n == name]
+            if ids_:
+                scale[np.isin(rugd.labels, ids_)] = mult
+        if not allow_grass:
+            g_ = [i for i, n in rugd.label_names.items() if n == "grass"]
+            if g_:
+                p_ground[np.isin(rugd.labels, g_)] = 0.0
+    p_ground[hard] = 0.0
+    classes = np.full(p_ground.shape, UNKNOWN, np.uint8)
+    classes[p_ground >= 0.5] = TRAVERSABLE
+    classes[hard] = OBSTACLE
+    notes = ["Multi-source: classical + RUGD + DeepScene ground evidence; hard veto from RUGD obstacles/bushes and DeepScene obstacles."] + list(rugd.notes)
+    return SegOutput(classes, p_ground, rugd.valid & deepscene.valid, "Multi-source (RUGD + DeepScene + classical)", notes, rugd.labels, rugd.label_names,
+                     p_cost=(p_ground * scale).astype(np.float32))
+
+
+def make_terrain_segmenter(primary: Segmenter, allow_grass: bool = True, veto_threshold: float | None = None,
+                           veg_weight: float | None = None, obstacle_threshold: float = 0.5) -> Segmenter:
+    """Terrain-aware fusion.  ``veg_weight`` set -> confidence-aware fusion; else the hard / soft veto fusion."""
+    if veg_weight is not None:
+        return lambda image: fuse_confidence_aware(primary(image), segment_classical(image), allow_grass, obstacle_threshold, veg_weight)
+    return lambda image: fuse_terrain_aware(primary(image), segment_classical(image), allow_grass, veto_threshold)
 
 
 def plant_detections(result: TraversabilityResult, min_area_fraction: float = 0.004) -> dict:
@@ -475,5 +571,5 @@ def detect_traversable_region(
         notes.append("Contrast normalisation (CLAHE) was applied because the image is dark.")
     if not traversable.any():
         notes.append("No traversable ground connected to the start region was found.")
-    return TraversabilityResult(classes, seg.p_trav, traversable, obstacles, seg.valid, rejected, seg.method,
-                                normalized, notes, seg.labels, seg.label_names)
+    return TraversabilityResult(classes, seg.p_cost if seg.p_cost is not None else seg.p_trav, traversable, obstacles, seg.valid,
+                                rejected, seg.method, normalized, notes, seg.labels, seg.label_names, seg.p_trav)
