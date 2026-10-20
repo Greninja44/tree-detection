@@ -25,8 +25,8 @@ import eval_navigation as ev  # noqa: E402
 from src import infer  # noqa: E402
 from src.navigation import estimate_navigation_direction, plan_local_path  # noqa: E402
 from src.pipeline import Models, NavParams  # noqa: E402
-from src.traversability import (detect_traversable_region, fuse_confidence_aware, fuse_obstacle_veto, fuse_terrain_aware,  # noqa: E402
-                                make_deepscene_segmenter, normalize_lighting, segment_classical)
+from src.traversability import (SegOutput, detect_traversable_region, fuse_confidence_aware, fuse_obstacle_veto, fuse_segmentations,  # noqa: E402
+                                fuse_multi_source, fuse_terrain_aware, make_deepscene_segmenter, make_rugd_segmenter, normalize_lighting, segment_classical)
 
 ANN = PROJECT_ROOT / "data/leaf_litter_pilot/annotations.json"
 CACHE = PROJECT_ROOT / "reports/leaf_litter/cache"
@@ -69,6 +69,40 @@ for _n in COCO_METHODS:
     METHODS[_n + " +coco"] = METHODS[_n]
 
 
+# RUGD-Segformer primary (needs models/rugd_segformer): evaluated on the same frames with the same planner and rules.
+RUGD_METHODS = {
+    "RUGD alone": lambda rg, cl: rg,
+    "RUGD+classical hybrid": lambda rg, cl: fuse_segmentations(rg, cl),
+    "RUGD classical-led + obstacle veto": lambda rg, cl: fuse_obstacle_veto(rg, cl),
+    "RUGD terrain-aware (label veto)": lambda rg, cl: fuse_terrain_aware(rg, cl, True, None),
+    **{f"RUGD conf-aware w={w}": (lambda w: lambda rg, cl: fuse_confidence_aware(rg, cl, True, 0.5, w))(w) for w in (1.0, 0.5, 0.0)},
+}
+
+
+# Multi-source (needs both primaries); designed AFTER seeing final_test results of the RUGD variants -> exploratory, see report.
+MULTI_METHODS = ["multi-source", "multi-source +coco"]
+
+
+def rugd_cached(f, models, params, norm, cache):
+    """RUGD SegOutput for a frame, cached on disk (it costs ~5 s/frame on the Jetson CPU)."""
+    fp = cache / f"rugd_{f['image']}.npz"
+    if fp.exists():
+        try:
+            z = np.load(fp, allow_pickle=True)
+            return SegOutput(z["classes"], z["p_trav"].astype(np.float32), z["valid"], "RUGD-Segformer", [], z["labels"],
+                             {int(k): v for k, v in z["names"].item().items()}, z["p_block"].astype(np.float32),
+                             z["p_obstacle"].astype(np.float32), z["p_vegetation"].astype(np.float32))
+        except Exception:
+            pass
+    seg = make_rugd_segmenter(models.rugd(), params.imgsz, "cpu")(norm)
+    tmp = fp.with_name(fp.stem + ".tmp.npz")
+    np.savez_compressed(tmp, classes=seg.classes, p_trav=seg.p_trav.astype(np.float16), valid=seg.valid, labels=seg.labels,
+                        names=np.array(seg.label_names, dtype=object), p_block=seg.p_block.astype(np.float16),
+                        p_obstacle=seg.p_obstacle.astype(np.float16), p_vegetation=seg.p_vegetation.astype(np.float16))
+    tmp.replace(fp)
+    return seg
+
+
 def hazard_hit(points: np.ndarray, hazards, W: int, H: int) -> bool:
     pad = 0.01 * W
     for x0, y0, x1, y1 in hazards:
@@ -78,7 +112,7 @@ def hazard_hit(points: np.ndarray, hazards, W: int, H: int) -> bool:
     return False
 
 
-def prepare_one(f, models, params, ds_fn):
+def prepare_one(f, models, params, ds_fn, with_rugd=False):
     """Everything needed for one frame (kept only while that frame is being scored, to bound memory)."""
     CACHE.mkdir(parents=True, exist_ok=True)
     img = cv2.imread(str(find_image(f["image"])))
@@ -114,19 +148,23 @@ def prepare_one(f, models, params, ds_fn):
         tgt = nav.start_y - nav.heading_lookahead * nav.lookahead
         ys, xs = np.nonzero(gt[int((tgt - .05) * H):int((tgt + .05) * H)])
         gt_ang = float(np.degrees(np.arctan2(xs.mean() - .5 * W, (nav.start_y - tgt) * H))) if xs.size else None
-    return dict(img=img, boxes=boxes, coco=coco, ds=ds, cl=cl, W=W, H=H, gt=gt, gt_ang=gt_ang, seg_s=seg_t)
+    rg = rugd_cached(f, models, params, norm, CACHE) if with_rugd else None
+    return dict(img=img, boxes=boxes, coco=coco, rg=rg, ds=ds, cl=cl, W=W, H=H, gt=gt, gt_ang=gt_ang, seg_s=seg_t)
 
 
 def run_method(name, fuse, f, p, params):
     t0 = time.perf_counter()
-    seg = fuse(p["ds"], p["cl"])
+    if name.startswith("multi-source"):
+        seg = fuse_multi_source(p["rg"], p["ds"], p["cl"])
+    else:
+        seg = fuse(p["rg"] if name in RUGD_METHODS else p["ds"], p["cl"])
     obstacle_boxes = list(p["boxes"]) + (list(p["coco"]) if name.endswith(" +coco") else [])
     trav = detect_traversable_region(p["img"], obstacle_boxes, lambda _i, _s=seg: _s, params.trav)
     plan = plan_local_path(trav.traversable, trav.obstacles, params.nav, trav.p_trav)
     dt = time.perf_counter() - t0
     r = {"method": name, "image": f["image"], "role": f["role"], "sequence": f["sequence"], "terrain": f["terrain"], "expected": f["expected"],
          "route": bool(plan.success), "code": plan.reason_code, "latency_fuse_plan_s": dt, "seg_s": p["seg_s"]}
-    if f["hazards"] and f["expected"] != "AMBIGUOUS":
+    if f["hazards"]:    # every frame with a hazard box counts, whatever its corridor label
         r["hazard_hit"] = bool(plan.success and hazard_hit(plan.points, f["hazards"], p["W"], p["H"]))
     if p["gt"] is not None:
         r["gt_recall"] = float((trav.traversable & p["gt"]).sum() / max(1, p["gt"].sum()))
@@ -157,7 +195,7 @@ def cluster_boot(rows, fn, n=2000, seed=0):
 def summarize(rows):
     lab = [r for r in rows if r["expected"] in ("GO", "STOP")]
     go, st = [r for r in lab if r["expected"] == "GO"], [r for r in lab if r["expected"] == "STOP"]
-    hz = [r for r in lab if "hazard_hit" in r]
+    hz = [r for r in rows if "hazard_hit" in r]
     gt = [r for r in rows if "gt_recall" in r]
     mean = lambda xs: float(np.mean(xs)) if xs else float("nan")  # noqa: E731
     out = {"n_labeled": len(lab), "n_GO": len(go), "n_STOP": len(st), "n_hazard_frames": len(hz), "n_gt_frames": len(gt),
@@ -177,14 +215,18 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--select", action="store_true", help="choose the conf-aware weight on dev, then score final_test once")
     ap.add_argument("--output", default="reports/leaf_litter_metrics.json")
+    ap.add_argument("--with-rugd", action="store_true", help="also score the RUGD-Segformer variants (cached on disk; ~5 s/frame first time)")
     a = ap.parse_args()
     models, params = Models(), NavParams(path_method="Terrain-aware (classical + DeepScene)")
     frames = load_frames()
     print(f"frames: {len(frames)} (pilot labelled + Finn GT)", flush=True)
     ds_fn = make_deepscene_segmenter(str(models.deepscene_path()))
+    if a.with_rugd:
+        METHODS.update(RUGD_METHODS)
+        METHODS.update({n: None for n in MULTI_METHODS})
     rows = {name: [] for name in METHODS}
     for k, f in enumerate(frames):
-        p = prepare_one(f, models, params, ds_fn)
+        p = prepare_one(f, models, params, ds_fn, a.with_rugd)
         for name, fn in METHODS.items():
             rows[name].append(run_method(name, fn, f, p, params))
         del p
@@ -202,7 +244,7 @@ def main() -> None:
         cur_dev = res["methods"]["current: soft veto 0.7"]["dev"]
         ok = []
         for name in METHODS:
-            if not name.startswith("conf-aware"):
+            if not (name.startswith("conf-aware") or name.startswith("RUGD")):   # multi-source is exploratory: never auto-selected
                 continue
             d = res["methods"][name]["dev"]
             safe = (d["false_safe_label"] <= cur_dev["false_safe_label"] + 1e-9 or d["n_STOP"] == 0) and d["false_safe_hazard"] <= cur_dev["false_safe_hazard"] + 1e-9
@@ -213,7 +255,7 @@ def main() -> None:
         print("selection:", res["selection"], flush=True)
     Path(a.output).write_text(json.dumps(res, indent=1, default=float))
     rows_flat = [r for rs in rows.values() for r in rs]
-    Path("reports/leaf_litter/per_frame.json").write_text(json.dumps(rows_flat, default=float))
+    Path("reports/leaf_litter/per_frame" + ("_rugd" if a.with_rugd else "") + ".json").write_text(json.dumps(rows_flat, default=float))
     fmt = lambda v: "n/a" if v != v else f"{100 * v:.0f}%"  # noqa: E731
     for role in ("dev", "final_test"):
         print(f"\n=== {role} ===")

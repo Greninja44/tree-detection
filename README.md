@@ -147,22 +147,24 @@ Takeaway: the trunk model is limited by its data and size (more ForTrunkDet-styl
 
 ### Leaf-litter false stops: diagnosis, options and what is still unsolved
 
-Full write-ups: `docs/leaf_litter/` (`leaf_litter_baseline.md`, `leaf_litter_diagnosis.md`, `leaf_litter_evaluation.md`, `leaf_litter_metrics.json`).
+Full write-ups: `docs/leaf_litter/` (baseline, diagnosis, evaluation, metrics). **All numbers below are exploratory**: the pilot labels are single-annotator and were corrected after results were seen (a visual audit found wrong hazard boxes), and there are 0 held-out STOP frames and only 7 hazard frames.
 
-- **Cause (measured):** DeepScene labels dry leaf litter "vegetation" (mean P(veg) 0.26-0.76 on litter floors vs 0.53 on the one dense-bush frame - no threshold separates them) and the veto turned vetoed pixels into hard obstacles; the grass caution also removed ground from eligibility. DeepScene's *obstacle* class is ~0 on every litter floor.
-- **Fixed in code (default behaviour unchanged):** `fuse_confidence_aware` (hard obstacles only from confirmed P(obstacle) or trunk/hazard footprints; vegetation only lowers ground confidence by a weight; grass caution affects route *cost* only), structured STOP reason codes (`PathPlan.reason_code`), opt-in COCO person/vehicle/animal footprints (`NavParams.hazard_detector`), and diagnosis / evaluation tools.
-- **Measured trade-offs (held-out final test: 69 GO frames, **1** STOP frame, 5 hazard frames; single-annotator pilot labels, wide CIs):**
+- **Cause (measured):** DeepScene has no leaf-litter class and labels litter "vegetation" (mean P(veg) 0.26-0.76 on litter floors vs 0.53 on the one dense-bush frame - no threshold separates them); the veto also turned vetoed pixels into hard obstacles, and the grass caution removed ground from eligibility. RUGD-Segformer, which has `mulch`/`dirt` and `bush`, does separate them.
+- **Code (defaults unchanged):** confidence-aware fusion, **multi-source fusion** (new opt-in method: ground = classical + RUGD + DeepScene evidence, hard veto from RUGD obstacles/bushes and DeepScene obstacles), structured STOP reason codes (`PathPlan.reason_code`), opt-in COCO person/vehicle footprints, diagnosis / evaluation / comparison tools.
+- **Held-out comparison (final test: 69 GO frames = 55 snow-track + 14 litter/trail; 7 frames with hazard boxes):**
 
-| Setting | held-out false-stop | dev STOP frames routed | held-out hazard frames routed |
-|---|---|---|---|
-| classical (default) | 1% | 3/3 | 1/5 |
-| terrain-aware + soft veto 0.7 (shipped) | 35% (snow 18%, litter/trail 14/14) | 1/3 | 0/5 |
-| confidence-aware, weight 1.0 (conservative) | 25% (snow 5%, litter/trail 14/14) | 1/3 | 0/5 |
-| confidence-aware, weight 0.0 + COCO hazards (**litter-friendly**) | 6% (snow 0%, litter/trail 4/14) | 2/3 | 1/5 |
+| Setting | false-stop (all / litter+trail 14 / snow 55) | hazard frames routed through (of 7) | snow heading error | CPU time / frame |
+|---|---|---|---|---|
+| classical (default) | 1% / 1 / 0% | 2 | 5.1 deg | 0.43 s |
+| terrain-aware + soft veto 0.7 (shipped option) | 35% / 14 / 18% | 0 | 7.5 deg | 1.4 s |
+| confidence-aware w=1.0 | 25% / 14 / 5% | 1 | 8.5 deg | 1.4 s |
+| confidence-aware w=0 + COCO | 6% / 4 / 0% | 1 | 9.4 deg | 1.7 s |
+| RUGD + classical hybrid | 1% / 0 / 2% | 1 | 19.0 deg | ~5 s |
+| **multi-source (opt-in)** | **6% / 0 / 7%** | **0** | 16.7 deg | **5.1 s**, ~2 GB RAM |
 
-  The pre-registered selection rule (lowest dev false-stop with no worse dev safety than the current veto) selected **nothing**, so no default was changed. Choose by risk: GUI *Advanced* -> *Confidence-aware fusion* + *Vegetation penalty weight* (+ *Detect people / vehicles*). Only snow-track false stops were demonstrably reduced at equal measured safety.
-- **Still unsolved:** separating leaf litter from dense vegetation needs labelled litter-floor and dense-bush images (and more true STOP frames). Format and protocol: `data/leaf_litter_pilot/annotations.json`.
-- **Reproduce:** `python scripts/diagnose_nav.py <frames>`; `python scripts/eval_leaf_litter.py --select`; `python scripts/compare_nav_variants.py ft_img2374 ft_img0707 ft_img0691 00166 00254`.
+  Multi-source is the only method here with no litter false stops *and* no routes through a labelled hazard, but it is slow and its snow-track heading is worse. The pre-registered selection rule (dev only) picked `conf-aware w=0`, which routed through 2/7 held-out hazards, so no default was changed. In the GUI pick *Multi-source* (needs `models/rugd_segformer` and `models/deepscene`) or use *Advanced* -> *Confidence-aware fusion* / *Detect people / vehicles*.
+- **To validate:** label a fresh set from your own camera (open litter floors, dense bushes, people/machines, true dead-ends), two reviewers, frozen protocol, score once. Format: `data/leaf_litter_pilot/annotations.json` (v2, with changelog).
+- **Reproduce:** `python scripts/diagnose_nav.py <frames>`; `python scripts/eval_leaf_litter.py --select --with-rugd`; `python scripts/compare_nav_variants.py ft_img2374 ft_img0707 ft_img0691 00166 00254`.
 
 ### Models evaluated and rejected
 
@@ -173,7 +175,7 @@ Same 68 FinnWoodlands frames and the same planner (`scripts/eval_navigation.py`;
 | Classical baseline (default) | 56/68 | 77% | 12.0° | no downloads; false routes in clutter |
 | **Terrain-aware, classical + DeepScene** | **58/68** | **83%** | 13.2° | stops correctly in dense vegetation/forest and at a machine; **false STOPs on 3 of 11 leaf-litter forest-floor scenarios** |
 | DeepScene alone | 55/68 | 76% | 14.9° | |
-| Terrain-aware, classical + RUGD | 56/68 | 59% | 20.9° | least accurate; 339 MB, ~5 s/frame -> **weights deleted** |
+| Terrain-aware, classical + RUGD | 56/68 | 59% | 20.9° | worst on snow (no snow class); 339 MB, ~5 s/frame. **Weights were deleted, then re-added** after the leaf-litter evaluation showed RUGD is the only primary that separates litter from bushes |
 | ADE20K SegFormer-B2 alone | 32/68 | 81% | 13.3° | misses snow; NVIDIA non-commercial license -> **deleted** |
 | Terrain-aware, classical + ADE20K | 45/68 | 78% | 15.9° | **deleted** |
 
@@ -624,7 +626,7 @@ tree-detection/
 ## 11. Testing
 
 ```bash
-.venv/bin/python -m pytest           # 120 tests
+.venv/bin/python -m pytest           # 123 tests
 .venv/bin/python -m pytest -v        # verbose
 ```
 

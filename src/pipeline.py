@@ -11,20 +11,21 @@ from src import infer
 from src.navigation import (STOP, Direction, DirectionSmoother, NavConfig, PathPlan, estimate_navigation_direction,
                             path_coverage, plan_local_path)
 from src.traversability import (Segmenter, TravConfig, TraversabilityResult, detect_traversable_region,
-                                make_ade_segmenter, make_deepscene_segmenter, make_hybrid_segmenter, make_rugd_segmenter,
+                                fuse_multi_source, make_ade_segmenter, make_deepscene_segmenter, make_hybrid_segmenter, make_rugd_segmenter,
                                 make_segformer_segmenter, make_terrain_segmenter, make_veto_segmenter,
-                                make_yolo_path_segmenter, plant_detections)
+                                make_yolo_path_segmenter, plant_detections, segment_classical)
 
 MODELS = infer.PROJECT_ROOT / "models"
 HYBRID = "RUGD + classical hybrid"
 TERRAIN = "Terrain-aware (classical + RUGD)"
 VETO = "Classical + obstacle veto"
 CLASSICAL = "Classical baseline"
+MULTI = "Multi-source (RUGD + DeepScene + classical)"
 DEEPSCENE = "DeepScene FCN"
 ADE = "ADE20K SegFormer"
 TERRAIN_DEEPSCENE = "Terrain-aware (classical + DeepScene)"
 TERRAIN_ADE = "Terrain-aware (classical + ADE20K)"
-PATH_METHODS = (CLASSICAL, TERRAIN, TERRAIN_DEEPSCENE, TERRAIN_ADE, VETO, HYBRID, "RUGD-Segformer", DEEPSCENE, ADE, "YOLO path model", "Off")
+PATH_METHODS = (CLASSICAL, MULTI, TERRAIN, TERRAIN_DEEPSCENE, TERRAIN_ADE, VETO, HYBRID, "RUGD-Segformer", DEEPSCENE, ADE, "YOLO path model", "Off")
 
 
 def available_methods() -> list[str]:
@@ -33,7 +34,7 @@ def available_methods() -> list[str]:
            "deepscene": (MODELS / "deepscene" / "fcn_resnet18.onnx").exists(),
            "ade": (MODELS / "ade_segformer_b2" / "pytorch_model.bin").exists(),
            "yolo": (MODELS / "forest_path_seg.pt").exists()}
-    needs = {CLASSICAL: True, "Off": True, TERRAIN: has["rugd"], VETO: has["rugd"], HYBRID: has["rugd"],
+    needs = {CLASSICAL: True, "Off": True, MULTI: has["rugd"] and has["deepscene"], TERRAIN: has["rugd"], VETO: has["rugd"], HYBRID: has["rugd"],
              "RUGD-Segformer": has["rugd"], TERRAIN_DEEPSCENE: has["deepscene"], DEEPSCENE: has["deepscene"],
              TERRAIN_ADE: has["ade"], ADE: has["ade"], "YOLO path model": has["yolo"]}
     return [m for m in PATH_METHODS if needs[m]]
@@ -142,6 +143,9 @@ class Models:
     def segmenter(self, method: str, imgsz: int, device: str, path_weights: str, allow_grass: bool = True,
                   veto_threshold: float | None = None, veg_weight: float | None = None,
                   obstacle_threshold: float = 0.5) -> Segmenter | None:
+        if method == MULTI:
+            rg, ds = make_rugd_segmenter(self.rugd(), imgsz, device), self.primary("DeepScene", imgsz, device)
+            return lambda image: fuse_multi_source(rg(image), ds(image), segment_classical(image), allow_grass)
         if method == TERRAIN:
             return make_terrain_segmenter(make_rugd_segmenter(self.rugd(), imgsz, device), allow_grass, veto_threshold, veg_weight, obstacle_threshold)
         if method == TERRAIN_DEEPSCENE:

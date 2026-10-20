@@ -124,3 +124,37 @@ def test_defaults_are_unchanged():
     p = NavParams()
     assert p.path_method == CLASSICAL and p.veto_threshold == 0.7 and p.veg_weight is None and p.obstacle_threshold == 0.5
     assert NavConfig().min_confidence == 0.35 and NavConfig().safety_margin == 0.02 and TravConfig().min_confidence == 0.5
+
+
+# ---- multi-source fusion -------------------------------------------------------------------------------------------
+def _rugd(label, p_trav=0.0, p_obs=0.0, p_bush=0.0, name="mulch"):
+    names = {0: "void", 1: name}
+    return SegOutput(np.full((S, S), UNKNOWN, np.uint8), np.full((S, S), p_trav, np.float32), np.ones((S, S), bool), "rugd", [],
+                     np.full((S, S), 1, np.uint8), names, None, np.full((S, S), p_obs, np.float32), np.full((S, S), p_bush, np.float32))
+
+
+def _ds(p_trav=0.0, p_obs=0.0, p_veg=0.0):
+    return SegOutput(np.full((S, S), UNKNOWN, np.uint8), np.full((S, S), p_trav, np.float32), np.ones((S, S), bool), "ds", [],
+                     np.full((S, S), 2, np.uint8), NAMES, None, np.full((S, S), p_obs, np.float32), np.full((S, S), p_veg, np.float32))
+
+
+def test_multi_source_litter_survives_deepscene_vegetation_label():
+    from src.traversability import fuse_multi_source
+    out = fuse_multi_source(_rugd(1, p_trav=0.9), _ds(p_veg=0.9), _classical(0.8))
+    assert (out.p_trav >= 0.5).all() and (out.classes == TRAVERSABLE).all()      # DeepScene "vegetation" is not a veto here
+
+
+def test_multi_source_vetoes_come_from_any_confirmed_obstacle_or_bush():
+    from src.traversability import fuse_multi_source
+    for rg, ds in ((_rugd(1, p_trav=0.9, p_obs=0.8), _ds()), (_rugd(1, p_trav=0.9, p_bush=0.8, name="bush"), _ds()), (_rugd(1, p_trav=0.9), _ds(p_obs=0.8))):
+        out = fuse_multi_source(rg, ds, _classical(0.95))
+        assert (out.p_trav == 0).all() and (out.classes == OBSTACLE).all()
+
+
+def test_multi_source_ground_is_the_union_of_evidence_and_grass_is_cost_only():
+    from src.traversability import fuse_multi_source
+    only_ds = fuse_multi_source(_rugd(1), _ds(p_trav=0.9), _classical(0.1))
+    assert (only_ds.p_trav >= 0.5).all()                                          # any one source can supply ground
+    grass = fuse_multi_source(_rugd(1, p_trav=0.6, name="grass"), _ds(), _classical(0.6))
+    assert (grass.p_trav >= 0.5).all() and (grass.p_cost < grass.p_trav).all()
+    assert fuse_multi_source(_rugd(1, p_trav=0.9, name="grass"), _ds(), _classical(0.9), allow_grass=False).p_trav.max() == 0

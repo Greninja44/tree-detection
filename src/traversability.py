@@ -143,9 +143,12 @@ class ClassGroups:
     obstacle: frozenset
     sky: frozenset
     traversable_weights: tuple = ()  # ((name, weight), ...) partial credit, e.g. grass passable at lower confidence
+    dense_vegetation: frozenset = frozenset()  # subset of `vegetation` counted in P(vegetation); empty = all of `vegetation`
 
 
-RUGD_GROUPS = ClassGroups(frozenset(RUGD_TRAVERSABLE), frozenset(RUGD_VEGETATION), frozenset(RUGD_OBSTACLE), frozenset(RUGD_SKY))
+# RUGD: grass is passable (with caution), bushes are the dense vegetation that blocks.
+RUGD_GROUPS = ClassGroups(frozenset(RUGD_TRAVERSABLE), frozenset(RUGD_VEGETATION), frozenset(RUGD_OBSTACLE), frozenset(RUGD_SKY),
+                          dense_vegetation=frozenset({"bush"}))
 # ADE20K (150 classes, SegFormer): bare ground / paths are traversable, plants/grass are vegetation, "mountain"/"hill" stay unknown.
 ADE_GROUPS = ClassGroups(
     frozenset({"path", "dirt track", "earth", "sand", "road", "sidewalk", "floor"}),
@@ -173,7 +176,7 @@ def make_segformer_segmenter(model, imgsz: int = 480, device: str = "cpu", group
     trav_ids = [i for i, nme in short.items() if nme in groups.traversable]
     sky_ids = [i for i, nme in short.items() if nme in groups.sky]
     block_ids = [i for i, nme in short.items() if nme in groups.obstacle]
-    veg_ids = [i for i, nme in short.items() if nme in groups.vegetation]
+    veg_ids = [i for i, nme in short.items() if nme in (groups.dense_vegetation or groups.vegetation)]
     mean = np.array([0.485, 0.456, 0.406], np.float32)
     std = np.array([0.229, 0.224, 0.225], np.float32)
     cfg = TravConfig()
@@ -434,6 +437,36 @@ def fuse_confidence_aware(primary: SegOutput, baseline: SegOutput, allow_grass: 
                                    "only from confirmed obstacle evidence; vegetation lowers ground confidence; grass caution affects route cost only."] + list(baseline.notes)
     return SegOutput(classes, p_dec, primary.valid, "Confidence-aware (classical + " + primary.method + ")", notes, primary.labels, primary.label_names,
                      p_cost=(p_dec * scale).astype(np.float32))
+
+
+def fuse_multi_source(rugd: SegOutput, deepscene: SegOutput, baseline: SegOutput, allow_grass: bool = True,
+                      obstacle_threshold: float = 0.5, bush_threshold: float = 0.5) -> SegOutput:
+    """Ground = union of evidence; hard veto = any source that confirms an obstacle.
+
+    Ground eligibility: ``max(0.9 * classical, RUGD ground, DeepScene trail)``.  Hard OBSTACLE (with margin) where RUGD's obstacle
+    group (trees, people, vehicles, logs, rocks, water ...) or DeepScene's obstacle class has P >= ``obstacle_threshold``, or RUGD's
+    *bush* class has P >= ``bush_threshold``.  DeepScene's "vegetation" is deliberately NOT a veto (it labels leaf litter that way).
+    Grass / rock-bed stay passable at a higher route cost (RUGD labels).  Trunk and hazard-detector footprints are added by the caller.
+    """
+    p_ground = np.maximum.reduce([baseline.p_trav * 0.9, rugd.p_trav, deepscene.p_trav]).astype(np.float32)
+    hard = (rugd.p_obstacle >= obstacle_threshold) | (deepscene.p_obstacle >= obstacle_threshold) | (rugd.p_vegetation >= bush_threshold)
+    scale = np.ones(p_ground.shape, np.float32)
+    if rugd.labels is not None and rugd.label_names is not None:
+        for name, mult in TERRAIN_CAUTION.items():
+            ids_ = [i for i, n in rugd.label_names.items() if n == name]
+            if ids_:
+                scale[np.isin(rugd.labels, ids_)] = mult
+        if not allow_grass:
+            g_ = [i for i, n in rugd.label_names.items() if n == "grass"]
+            if g_:
+                p_ground[np.isin(rugd.labels, g_)] = 0.0
+    p_ground[hard] = 0.0
+    classes = np.full(p_ground.shape, UNKNOWN, np.uint8)
+    classes[p_ground >= 0.5] = TRAVERSABLE
+    classes[hard] = OBSTACLE
+    notes = ["Multi-source: classical + RUGD + DeepScene ground evidence; hard veto from RUGD obstacles/bushes and DeepScene obstacles."] + list(rugd.notes)
+    return SegOutput(classes, p_ground, rugd.valid & deepscene.valid, "Multi-source (RUGD + DeepScene + classical)", notes, rugd.labels, rugd.label_names,
+                     p_cost=(p_ground * scale).astype(np.float32))
 
 
 def make_terrain_segmenter(primary: Segmenter, allow_grass: bool = True, veto_threshold: float | None = None,

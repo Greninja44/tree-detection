@@ -35,6 +35,7 @@ with st.sidebar:
                            index=trunk_files.index("tree_trunk.pt") if "tree_trunk.pt" in trunk_files else 0) if trunk_files else None
     method = st.radio("Path segmentation method", available_methods(),
                       format_func=lambda m: {
+                          "Multi-source (RUGD + DeepScene + classical)": "Multi-source: RUGD + DeepScene + classical (litter-capable, safer; ~6 s/frame; exploratory)",
                           "Terrain-aware (classical + RUGD)": "Terrain-aware (plants + terrain types; not yet evaluated)",
                           "Classical baseline": "Classical baseline (fast, best on trails; no safety veto)",
                           "Terrain-aware (classical + DeepScene)": "Terrain-aware + DeepScene (safer, fast; plants & terrain)",

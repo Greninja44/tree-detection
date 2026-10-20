@@ -22,7 +22,7 @@ Counterfactuals re-run the planner with one component switched off (terrain-awar
    classical confidence (0.68 mean) below the 0.5 eligibility threshold. Caution should raise route *cost*, not remove ground. (Fixed: `p_cost`.)
 
 ## What does NOT separate litter from real vegetation (negative results)
-On the dev frames (19 GO litter/trail/grass frames, 3 STOP frames; `scripts/diagnose_nav.py` statistics):
+On the dev frames (19 GO litter/trail/grass frames plus the dense-bush frame ft_img0707; `00166`/`00178` were STOP in the v1 labels and are AMBIGUOUS in v2):
 - DeepScene mean P(vegetation) on the classical floor: litter/trail GO frames **0.26-0.76**; the dense-bush STOP frame (ft_img0707) **0.53** - inside the GO range. No threshold on it, per pixel
   or region-averaged, can separate them (the soft veto at 0.5-0.85 never fixed the litter frames).
 - "Vegetation AND green" (living plants are green, litter is brown/grey): share of the floor satisfying it is ~0% for every frame including the dense-bush one (the bushes lie outside the
@@ -127,3 +127,11 @@ See `leaf_litter_evaluation.md` for the measured trade-offs.
   "OBSTACLE_BLOCKS_CORRIDOR": 1
  }
 }
+
+## Update: why RUGD works where DeepScene does not (exploratory)
+RUGD-Segformer has classes for the things that matter here: `mulch`/`dirt`/`gravel` (ground, i.e. leaf litter), `grass`, `bush` (dense vegetation), `tree`, `person`, `vehicle`, `log`, `rock`. On the held-out litter, trail and grass frames
+RUGD-based methods never stop (0/14) where the DeepScene veto stops on 14/14, and the dense-bush frame is still stopped. So the failure is the *label set* of DeepScene (no litter class), not the planner or the fusion
+plumbing. RUGD's weaknesses are the opposite: no snow class, and unfamiliar machines (the robot) are often not recognised. The multi-source fusion combines them (see `leaf_litter_evaluation.md`; exploratory).
+
+## Label audit (important)
+Drawing every hazard box on its frame showed that several v1 boxes were wrong or shifted and that three STOP labels were debatable. The v2 corrections (geometry only) are logged in the annotations file. All v1-based false-safe figures are invalid.
