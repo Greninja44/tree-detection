@@ -131,6 +131,20 @@ Real-image scenarios (`scripts/nav_scenarios.py --method ...`, frames picked by 
 Takeaway: the default is accurate on trails but not safe in clutter; the veto variant removes the false GOs on trees, trunks and
 machines but not on dense bushes (only the RUGD-vegetation veto in the hybrid catches those, at the cost of missing routes on grass).
 
+### Accuracy tuning: what helped and what did not
+
+Everything below was tuned on training/validation data and scored on held-out data (`scripts/tune_trunk.py`, `scripts/tune_nav.py`).
+
+| Change | Result | Adopted |
+|---|---|---|
+| **Soft veto (0.7)** for the DeepScene terrain-aware method (block only where P(obstacle or dense vegetation) >= 0.7, instead of wherever those classes win the argmax) | GT-track frames: route found 58 -> 63 of 68, heading error 13.2 -> 12.0 deg; every scenario's STOP/GO outcome unchanged | **yes** (terrain-aware methods) |
+| Trunk confidence threshold chosen on validation (0.30 vs 0.40) | Test F1 0.720 vs 0.718, recall 0.75 vs 0.71 but tree-count error worse (1.43 vs 1.29) | no - kept 0.40 |
+| Trunk inference size 800 / 960 px (model trained at 640) | Validation best F1 0.785 / 0.761 vs 0.793 at 640 | no |
+| Planner parameters (lateral preference, goal penalty, clearance weight, smoothing, start shift) with look-ahead rows and all safety margins frozen | Classical: +1.8 pts held-out score (k_lat 2 -> 6); DeepScene: +1.1 pts with five changes that disagree with the classical run | no - within noise for a groomed-track proxy |
+| Soft veto on **leaf-litter forest floors** | Does not help: DeepScene is >0.85 confident those floors are obstacle/vegetation, so the false STOPs remain at every threshold | n/a - needs labelled data |
+
+Takeaway: the trunk model is limited by its data and size (more ForTrunkDet-style data or a larger model trained on the PC is the next step, e.g. `--trunk-model yolov8m.pt --imgsz 640 --epochs 150`), and the remaining false STOPs need labelled litter-floor images, not parameter tuning.
+
 ### Models evaluated and rejected
 
 Same 68 FinnWoodlands frames and the same planner (`scripts/eval_navigation.py`; groomed-track proxy, see caveats above):
@@ -158,7 +172,7 @@ Also deleted as bad/superseded: the first CPU-trained trunk model (mAP 0.36) and
 - [ ] **Closed-loop validation**: the direction labels are steering *suggestions*. Test on the vehicle in a safe area with an independent safety stop before using them as commands.
 - [ ] **Real-time on Jetson**: install a JetPack-matched PyTorch (or export to TensorRT). Today a frame takes ~1 s for trunks plus ~0.2 s for DeepScene (or ~0.3 s classical) at 480 px on CPU.
 - [ ] **Low light**: heavily darkened images produce noisy segmentation and STOP; evaluate on real night/dusk data.
-- [ ] **Higher-accuracy trunk run** (planned, not run): `python train_on_pc.py --only trunk --trunk-model yolov8m.pt --imgsz 960 --batch 8 --epochs 150 --patience 50 --tag _m960`
+- [ ] **Higher-accuracy trunk run** on the PC (planned, not run). Inference-time tuning gave no reliable gain (see above); try `python train_on_pc.py --only trunk --trunk-model yolov8m.pt --imgsz 640 --batch 8 --epochs 150 --patience 50 --tag _m640` (960 px training is unproven: 960 px inference was worse for the 640-trained model).
 - [ ] **Bright-daylight / overcast data**: trunk recall in bright sun is only 0.25 and the datasets do not cover all five lighting conditions; add real lighting labels (`data/lighting_labels.json`).
 - [ ] **Tune the planner thresholds** (look-ahead, minimum reach, margins) on labelled routes; the narrow-snow-track false stop is an example.
 - [ ] **Model weights hosting** (`*.pt` is git-ignored) and **license checks** (FinnWoodlands is research-use; RUGD-Segformer lists none).
@@ -591,7 +605,7 @@ tree-detection/
 ## 11. Testing
 
 ```bash
-.venv/bin/python -m pytest           # 105 tests
+.venv/bin/python -m pytest           # 106 tests
 .venv/bin/python -m pytest -v        # verbose
 ```
 

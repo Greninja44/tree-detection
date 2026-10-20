@@ -53,6 +53,7 @@ class NavParams:
     imgsz: int = 480
     path_method: str = CLASSICAL
     allow_grass: bool = True
+    veto_threshold: float | None = 0.7  # soft veto for terrain-aware methods (None = argmax veto); 0.7 scored best on GT frames
     trunk_weights: str = "tree_trunk.pt"
     path_weights: str = "forest_path_seg.pt"
     device: str = "auto"
@@ -134,13 +135,14 @@ class Models:
             return make_ade_segmenter(self.ade().to(device), max(imgsz, 512), device)
         raise ValueError(name)
 
-    def segmenter(self, method: str, imgsz: int, device: str, path_weights: str, allow_grass: bool = True) -> Segmenter | None:
+    def segmenter(self, method: str, imgsz: int, device: str, path_weights: str, allow_grass: bool = True,
+                  veto_threshold: float | None = None) -> Segmenter | None:
         if method == TERRAIN:
-            return make_terrain_segmenter(make_rugd_segmenter(self.rugd(), imgsz, device), allow_grass)
+            return make_terrain_segmenter(make_rugd_segmenter(self.rugd(), imgsz, device), allow_grass, veto_threshold)
         if method == TERRAIN_DEEPSCENE:
-            return make_terrain_segmenter(self.primary("DeepScene", imgsz, device), allow_grass)
+            return make_terrain_segmenter(self.primary("DeepScene", imgsz, device), allow_grass, veto_threshold)
         if method == TERRAIN_ADE:
-            return make_terrain_segmenter(self.primary("ADE20K", imgsz, device), allow_grass)
+            return make_terrain_segmenter(self.primary("ADE20K", imgsz, device), allow_grass, veto_threshold)
         if method == DEEPSCENE:
             return self.primary("DeepScene", imgsz, device)
         if method == ADE:
@@ -174,7 +176,7 @@ def run_navigation(image: np.ndarray, models: Models, params: NavParams | None =
         return out
     t = time.perf_counter()
     try:
-        seg = models.segmenter(p.path_method, p.imgsz, device, p.path_weights, p.allow_grass)
+        seg = models.segmenter(p.path_method, p.imgsz, device, p.path_weights, p.allow_grass, p.veto_threshold)
     except ModelUnavailable as exc:
         if p.path_method != TERRAIN:
             raise

@@ -195,3 +195,19 @@ def test_available_methods_only_lists_methods_with_weights(tmp_path, monkeypatch
     (tmp_path / "deepscene").mkdir()
     (tmp_path / "deepscene" / "fcn_resnet18.onnx").write_bytes(b"x")
     assert pl.TERRAIN_DEEPSCENE in pl.available_methods() and pl.TERRAIN not in pl.available_methods()
+
+
+def test_soft_veto_keeps_ground_the_model_is_unsure_about():
+    names = {0: "trail", 1: "vegetation"}
+    labels = np.ones((6, 6), np.uint8)                    # "vegetation" wins the argmax everywhere ...
+    p_block = np.full((6, 6), 0.55, np.float32)           # ... but only barely
+    primary = SegOutput(np.full((6, 6), 2, np.uint8), np.full((6, 6), 0.4, np.float32), np.ones((6, 6), bool), "t", [],
+                        labels, names, p_block)
+    base = _seg(np.full((6, 6), TRAVERSABLE), np.full((6, 6), 0.9))
+    hard = fuse_terrain_aware(primary, base)                       # argmax veto: "vegetation" is blocked
+    soft_low = fuse_terrain_aware(primary, base, veto_threshold=0.5)
+    soft_high = fuse_terrain_aware(primary, base, veto_threshold=0.7)
+    assert (hard.p_trav == 0).all() and (soft_low.p_trav == 0).all()
+    assert (soft_high.p_trav > 0.5).all()                          # unsure -> not vetoed at the higher threshold
+    strong = SegOutput(primary.classes, primary.p_trav, primary.valid, "t", [], labels, names, np.full((6, 6), 0.95, np.float32))
+    assert (fuse_terrain_aware(strong, base, veto_threshold=0.7).p_trav == 0).all()   # confident -> still vetoed

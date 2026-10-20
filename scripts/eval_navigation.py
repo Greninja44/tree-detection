@@ -48,21 +48,32 @@ def cached_seg(models, params, device, img, key, cache: Path):
     fused = {TERRAIN: "RUGD-Segformer", TERRAIN_DEEPSCENE: DEEPSCENE, TERRAIN_ADE: ADE}
     if params.path_method in fused:
         base = cached_seg(models, NavParams(path_method=fused[params.path_method], imgsz=params.imgsz, device=params.device), device, img, key, cache)
-        return fuse_terrain_aware(base, segment_classical(norm, params.trav), params.allow_grass)
+        return fuse_terrain_aware(base, segment_classical(norm, params.trav), params.allow_grass, params.veto_threshold)
     if params.path_method == VETO:
         base = cached_seg(models, NavParams(path_method="RUGD-Segformer", imgsz=params.imgsz, device=params.device), device, img, key, cache)
         return fuse_obstacle_veto(base, segment_classical(norm, params.trav))
     f = cache / f"seg_{params.path_method.split()[0][:6]}_{params.imgsz}_{key}.npz"
+    z = None
     if f.exists():
-        z = np.load(f, allow_pickle=True)
+        try:
+            z = np.load(f, allow_pickle=True)
+            z.files  # touch: raises if the file is truncated
+        except Exception:  # truncated by an interrupted run: recompute
+            z = None
+    if z is not None:
         names = {int(k): v for k, v in z["names"].item().items()} if "names" in z.files else None
         return SegOutput(z["classes"], z["p_trav"].astype(np.float32), z["valid"], str(z["method"]), list(z["notes"]),
-                         z["labels"] if "labels" in z.files else None, names)
+                         z["labels"] if "labels" in z.files else None, names,
+                         z["p_block"].astype(np.float32) if "p_block" in z.files else None)
     seg_fn = models.segmenter(params.path_method, params.imgsz, device, params.path_weights)
     seg = seg_fn(norm) if seg_fn else segment_classical(norm, params.trav)
     extra = {} if seg.labels is None else {"labels": seg.labels, "names": np.array(seg.label_names, dtype=object)}
-    np.savez_compressed(f, classes=seg.classes, p_trav=seg.p_trav.astype(np.float16), valid=seg.valid, method=seg.method,
+    if seg.p_block is not None:
+        extra["p_block"] = seg.p_block.astype(np.float16)
+    f_tmp = f.with_name(f.stem + ".tmp.npz")
+    np.savez_compressed(f_tmp, classes=seg.classes, p_trav=seg.p_trav.astype(np.float16), valid=seg.valid, method=seg.method,
                         notes=np.array(seg.notes, dtype=object), **extra)
+    f_tmp.replace(f)
     return seg
 
 
@@ -71,6 +82,7 @@ def main() -> None:
     ap.add_argument("--methods", default="Classical baseline,Terrain-aware (classical + RUGD),Classical + obstacle veto,RUGD + classical hybrid")
     ap.add_argument("--stride", type=int, default=3)
     ap.add_argument("--imgsz", type=int, default=480)
+    ap.add_argument("--veto-threshold", type=float, default=None, help="Soft veto threshold for terrain-aware methods (default: argmax veto).")
     ap.add_argument("--output", default="reports/navigation_eval")
     a = ap.parse_args()
     out = Path(a.output)
@@ -85,7 +97,7 @@ def main() -> None:
     cache.mkdir(exist_ok=True)
     models, rows = Models(), []
     for method in a.methods.split(","):
-        params = NavParams(path_method=method, imgsz=a.imgsz)
+        params = NavParams(path_method=method, imgsz=a.imgsz, veto_threshold=a.veto_threshold)
         dead = params.nav.straight_deg
         for img_p, lab in frames:
             img = cv2.imread(str(img_p))
@@ -121,7 +133,7 @@ def main() -> None:
             rows.append(row)
             print(row, flush=True)
     keys = ["method", "image", "route_found", "gt_angle", "pred_angle", "abs_angle_err", "side_agree", "route_on_track", "gt_recall_in_traversable"]
-    with open(out / "per_frame.csv", "w", newline="") as fh:
+    with open(out / f"per_frame{'' if a.veto_threshold is None else f'_veto{a.veto_threshold}'}.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=keys, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)

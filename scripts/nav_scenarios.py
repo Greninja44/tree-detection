@@ -51,11 +51,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--method", default=PATH_METHODS[0], choices=PATH_METHODS)
     ap.add_argument("--imgsz", type=int, default=480)
+    ap.add_argument("--veto-threshold", type=float, default=None, help="Soft veto threshold for terrain-aware methods.")
     ap.add_argument("--output", default="reports/navigation_scenarios")
     a = ap.parse_args()
     out = Path(a.output)
     out.mkdir(parents=True, exist_ok=True)
-    models, params = Models(), NavParams(path_method=a.method, imgsz=a.imgsz)
+    models, params = Models(), NavParams(path_method=a.method, imgsz=a.imgsz, veto_threshold=a.veto_threshold)
     tiles, lines = [], [f"# Navigation scenarios ({a.method}, imgsz {a.imgsz})\n", "| scenario | frame | trunks | direction | route | coverage | confidence | note |", "|---|---|---|---|---|---|---|---|"]
     for name, stem, variant in SCENARIOS:
         img = cv2.imread(str(find(stem)))

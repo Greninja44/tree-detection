@@ -57,6 +57,10 @@ with st.sidebar:
         p_trav = st.slider("Ground confidence needed (P traversable)", 0.2, 0.9, 0.5, 0.05)
         clear = st.slider("Minimum corridor half-width (% of width)", 0.5, 5.0, 1.5, 0.5)
         allow_grass = st.checkbox("Allow driving over grass (at a cost)", True, help="Terrain-aware method only; bushes, water, rocks and trees are always blocked.")
+        soft = st.checkbox("Soft obstacle/vegetation veto (terrain-aware)", True,
+                           help="Block a pixel only where the terrain model's obstacle+vegetation probability is high, instead of wherever those classes win. "
+                                "More routes found on the ground-truth check; weaker veto. Does not fix leaf-litter false stops.")
+        veto_t = st.slider("Veto threshold", 0.5, 0.95, 0.7, 0.05) if soft else None
         normalize = st.checkbox("Contrast normalisation (CLAHE) for dark images", True)
 
 up = st.file_uploader("Upload an image or a video", type=["jpg", "jpeg", "png"] + [e[1:] for e in VIDEO_EXT])
@@ -68,7 +72,7 @@ if trunk_w is None:
     st.stop()
 
 params = NavParams(
-    conf=conf, imgsz=imgsz, path_method=method, trunk_weights=trunk_w, device=device, allow_grass=allow_grass,
+    conf=conf, imgsz=imgsz, path_method=method, trunk_weights=trunk_w, device=device, allow_grass=allow_grass, veto_threshold=veto_t,
     nav=NavConfig(lookahead=lookahead / 100, safety_margin=margin / 100, smoothing=smoothing,
                   min_confidence=min_conf, min_clearance=clear / 100),
     trav=TravConfig(min_confidence=p_trav, normalize_lighting=normalize),
