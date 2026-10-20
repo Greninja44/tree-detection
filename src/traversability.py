@@ -63,6 +63,9 @@ class SegOutput:
     labels: np.ndarray | None = None          # (H, W) uint8 fine terrain id (e.g. RUGD: grass, bush, dirt ...) or None
     label_names: dict[int, str] | None = None
     p_block: np.ndarray | None = None         # (H, W) float32 P(obstacle or dense vegetation) for soft vetoes, or None
+    p_obstacle: np.ndarray | None = None      # (H, W) float32 P(confirmed obstacle class) or None
+    p_vegetation: np.ndarray | None = None    # (H, W) float32 P(dense-vegetation class) or None
+    p_cost: np.ndarray | None = None          # (H, W) float32 route-cost confidence (decision probability x caution); planner only
 
 
 @dataclass
@@ -78,6 +81,7 @@ class TraversabilityResult:
     notes: list[str] = field(default_factory=list)
     labels: np.ndarray | None = None
     label_names: dict[int, str] | None = None
+    p_decision: np.ndarray | None = None      # eligibility probability (what was thresholded); p_trav is the planner-cost map
 
 
 Segmenter = Callable[[np.ndarray], SegOutput]
@@ -169,6 +173,7 @@ def make_segformer_segmenter(model, imgsz: int = 480, device: str = "cpu", group
     trav_ids = [i for i, nme in short.items() if nme in groups.traversable]
     sky_ids = [i for i, nme in short.items() if nme in groups.sky]
     block_ids = [i for i, nme in short.items() if nme in groups.obstacle]
+    veg_ids = [i for i, nme in short.items() if nme in groups.vegetation]
     mean = np.array([0.485, 0.456, 0.406], np.float32)
     std = np.array([0.229, 0.224, 0.225], np.float32)
     cfg = TravConfig()
@@ -198,6 +203,8 @@ def make_segformer_segmenter(model, imgsz: int = 480, device: str = "cpu", group
             labels=up(arg.astype(np.uint8), cv2.INTER_NEAREST),
             label_names=short,
             p_block=np.clip(up(p_block, cv2.INTER_LINEAR), 0, 1),
+            p_obstacle=np.clip(up(p_block, cv2.INTER_LINEAR), 0, 1),
+            p_vegetation=np.clip(up(prob[veg_ids].sum(0).astype(np.float32), cv2.INTER_LINEAR), 0, 1),
         )
 
     return run
@@ -243,7 +250,8 @@ def make_deepscene_segmenter(onnx_path: str, grass_weight: float = 0.6) -> Segme
         sky[int(0.45 * H):] = False
         p_block = np.clip(up_p[2] + up_p[3], 0, 1).astype(np.float32)  # dense vegetation + obstacle
         return SegOutput(classes, p_trav, ~sky, "DeepScene FCN", ["DeepScene FCN-ResNet18 (Freiburg Forest trails): summer-forest trained, coarse output."],
-                         arg.astype(np.uint8), DEEPSCENE_NAMES, p_block)
+                         arg.astype(np.uint8), DEEPSCENE_NAMES, p_block, np.clip(up_p[3], 0, 1).astype(np.float32),
+                         np.clip(up_p[2], 0, 1).astype(np.float32))
 
     return run
 
@@ -391,7 +399,48 @@ def fuse_terrain_aware(primary: SegOutput, baseline: SegOutput, allow_grass: boo
     return SegOutput(classes, p, primary.valid, "Terrain-aware (classical + RUGD)", notes, primary.labels, names)
 
 
-def make_terrain_segmenter(primary: Segmenter, allow_grass: bool = True, veto_threshold: float | None = None) -> Segmenter:
+def fuse_confidence_aware(primary: SegOutput, baseline: SegOutput, allow_grass: bool = True,
+                          obstacle_threshold: float = 0.5, veg_weight: float = 1.0) -> SegOutput:
+    """Classical-led ground with a confidence-weighted vegetation penalty and a *separate* hard obstacle rule.
+
+    * ``p_decision = max(0.9 * classical, primary ground) * (1 - veg_weight * P(vegetation))`` is what gets thresholded.
+      ``veg_weight = 1`` blocks ground the model calls vegetation; smaller values trade safety for fewer false stops.
+    * Hard OBSTACLE (with the planner's safety margin) only where ``P(obstacle) >= obstacle_threshold`` - confirmed
+      evidence.  Vegetation-vetoed or unsure pixels are merely not eligible (class VEGETATION / UNKNOWN), no margin.
+    * Caution for grass / rock-bed lowers only the planner's *cost* confidence (``p_cost``), never eligibility.
+    Needs ``primary.p_obstacle`` / ``p_vegetation``; otherwise falls back to :func:`fuse_terrain_aware`.
+    """
+    if primary.p_obstacle is None or primary.p_vegetation is None:
+        return fuse_terrain_aware(primary, baseline, allow_grass)
+    base = np.maximum(baseline.p_trav * 0.9, primary.p_trav)
+    p_dec = (base * (1.0 - veg_weight * primary.p_vegetation)).astype(np.float32)
+    hard = primary.p_obstacle >= obstacle_threshold
+    scale = np.ones(p_dec.shape, np.float32)
+    if primary.labels is not None and primary.label_names is not None:
+        for name, mult in TERRAIN_CAUTION.items():
+            ids_ = [i for i, n in primary.label_names.items() if n == name]
+            if ids_:
+                scale[np.isin(primary.labels, ids_)] = mult
+        if not allow_grass:
+            g_ = [i for i, n in primary.label_names.items() if n == "grass"]
+            if g_:
+                p_dec[np.isin(primary.labels, g_)] = 0.0
+    p_dec[hard] = 0.0
+    classes = np.full(p_dec.shape, UNKNOWN, np.uint8)
+    classes[primary.classes == VEGETATION] = VEGETATION
+    classes[p_dec >= 0.5] = TRAVERSABLE
+    classes[hard] = OBSTACLE
+    notes = list(primary.notes) + [f"Confidence-aware fusion (veg weight {veg_weight}, obstacle threshold {obstacle_threshold}): hard obstacles "
+                                   "only from confirmed obstacle evidence; vegetation lowers ground confidence; grass caution affects route cost only."] + list(baseline.notes)
+    return SegOutput(classes, p_dec, primary.valid, "Confidence-aware (classical + " + primary.method + ")", notes, primary.labels, primary.label_names,
+                     p_cost=(p_dec * scale).astype(np.float32))
+
+
+def make_terrain_segmenter(primary: Segmenter, allow_grass: bool = True, veto_threshold: float | None = None,
+                           veg_weight: float | None = None, obstacle_threshold: float = 0.5) -> Segmenter:
+    """Terrain-aware fusion.  ``veg_weight`` set -> confidence-aware fusion; else the hard / soft veto fusion."""
+    if veg_weight is not None:
+        return lambda image: fuse_confidence_aware(primary(image), segment_classical(image), allow_grass, obstacle_threshold, veg_weight)
     return lambda image: fuse_terrain_aware(primary(image), segment_classical(image), allow_grass, veto_threshold)
 
 
@@ -489,5 +538,5 @@ def detect_traversable_region(
         notes.append("Contrast normalisation (CLAHE) was applied because the image is dark.")
     if not traversable.any():
         notes.append("No traversable ground connected to the start region was found.")
-    return TraversabilityResult(classes, seg.p_trav, traversable, obstacles, seg.valid, rejected, seg.method,
-                                normalized, notes, seg.labels, seg.label_names)
+    return TraversabilityResult(classes, seg.p_cost if seg.p_cost is not None else seg.p_trav, traversable, obstacles, seg.valid,
+                                rejected, seg.method, normalized, notes, seg.labels, seg.label_names, seg.p_trav)

@@ -44,6 +44,19 @@ def detect_trunks(model, img_bgr: np.ndarray, conf: float, imgsz: int,
     return [(*map(float, b), float(c)) for b, c in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.conf.cpu().numpy())]
 
 
+COCO_HAZARD_IDS = [0, 1, 2, 3, 5, 6, 7] + list(range(14, 24))   # person, bicycle, car, motorcycle, bus, train, truck, animals
+
+
+def detect_hazards(model, img_bgr: np.ndarray, conf: float = 0.25, imgsz: int = 640,
+                   dev: str | None = None) -> list[tuple[float, float, float, float, float]]:
+    """People / vehicles / animals from a COCO detector (e.g. yolov8n.pt), as (x0, y0, x1, y1, conf) obstacle boxes.
+
+    Partial coverage only: it finds people reasonably often but not reliably machines or unusual vehicles."""
+    r = model.predict(img_bgr, conf=conf, imgsz=imgsz, device=dev or device(), verbose=False)[0]
+    keep = np.isin(r.boxes.cls.cpu().numpy().astype(int), COCO_HAZARD_IDS)
+    return [(*map(float, b), float(c)) for b, c in zip(r.boxes.xyxy.cpu().numpy()[keep], r.boxes.conf.cpu().numpy()[keep])]
+
+
 def _path_result(mask: np.ndarray) -> PathResult:
     H, W = mask.shape
     xs = np.nonzero(mask[int(H * 0.75):])[1]

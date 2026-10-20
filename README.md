@@ -145,6 +145,25 @@ Everything below was tuned on training/validation data and scored on held-out da
 
 Takeaway: the trunk model is limited by its data and size (more ForTrunkDet-style data or a larger model trained on the PC is the next step, e.g. `--trunk-model yolov8m.pt --imgsz 640 --epochs 150`), and the remaining false STOPs need labelled litter-floor images, not parameter tuning.
 
+### Leaf-litter false stops: diagnosis, options and what is still unsolved
+
+Full write-ups: `docs/leaf_litter/` (`leaf_litter_baseline.md`, `leaf_litter_diagnosis.md`, `leaf_litter_evaluation.md`, `leaf_litter_metrics.json`).
+
+- **Cause (measured):** DeepScene labels dry leaf litter "vegetation" (mean P(veg) 0.26-0.76 on litter floors vs 0.53 on the one dense-bush frame - no threshold separates them) and the veto turned vetoed pixels into hard obstacles; the grass caution also removed ground from eligibility. DeepScene's *obstacle* class is ~0 on every litter floor.
+- **Fixed in code (default behaviour unchanged):** `fuse_confidence_aware` (hard obstacles only from confirmed P(obstacle) or trunk/hazard footprints; vegetation only lowers ground confidence by a weight; grass caution affects route *cost* only), structured STOP reason codes (`PathPlan.reason_code`), opt-in COCO person/vehicle/animal footprints (`NavParams.hazard_detector`), and diagnosis / evaluation tools.
+- **Measured trade-offs (held-out final test: 69 GO frames, **1** STOP frame, 5 hazard frames; single-annotator pilot labels, wide CIs):**
+
+| Setting | held-out false-stop | dev STOP frames routed | held-out hazard frames routed |
+|---|---|---|---|
+| classical (default) | 1% | 3/3 | 1/5 |
+| terrain-aware + soft veto 0.7 (shipped) | 35% (snow 18%, litter/trail 14/14) | 1/3 | 0/5 |
+| confidence-aware, weight 1.0 (conservative) | 25% (snow 5%, litter/trail 14/14) | 1/3 | 0/5 |
+| confidence-aware, weight 0.0 + COCO hazards (**litter-friendly**) | 6% (snow 0%, litter/trail 4/14) | 2/3 | 1/5 |
+
+  The pre-registered selection rule (lowest dev false-stop with no worse dev safety than the current veto) selected **nothing**, so no default was changed. Choose by risk: GUI *Advanced* -> *Confidence-aware fusion* + *Vegetation penalty weight* (+ *Detect people / vehicles*). Only snow-track false stops were demonstrably reduced at equal measured safety.
+- **Still unsolved:** separating leaf litter from dense vegetation needs labelled litter-floor and dense-bush images (and more true STOP frames). Format and protocol: `data/leaf_litter_pilot/annotations.json`.
+- **Reproduce:** `python scripts/diagnose_nav.py <frames>`; `python scripts/eval_leaf_litter.py --select`; `python scripts/compare_nav_variants.py ft_img2374 ft_img0707 ft_img0691 00166 00254`.
+
 ### Models evaluated and rejected
 
 Same 68 FinnWoodlands frames and the same planner (`scripts/eval_navigation.py`; groomed-track proxy, see caveats above):
@@ -166,7 +185,7 @@ Also deleted as bad/superseded: the first CPU-trained trunk model (mAP 0.36) and
 ## Remaining work
 
 - [ ] **Representative path data**: no ground-truth *routes* exist for these forests; the check above uses only the groomed-track mask. Label drivable corridors on images from the target robot's camera and measure route/heading accuracy properly.
-- [ ] **Fine-tune DeepScene (or another small segmenter) on litter-covered forest floors** to remove its false STOPs there, then re-score; RUGD/ADE20K lost to it here.
+- [ ] **Fine-tune DeepScene (or another small segmenter) on litter-covered forest floors and dense bushes** to remove its false STOPs without losing the vegetation veto; the leaf-litter evaluation shows no threshold can (see above). Review/extend the pilot labels first.
 - [ ] **Fine-tune a forest segmentation model** (traversable / vegetation / obstacle) on that data; RUGD has no snow class and was not validated on your camera. The hybrid is a stop-gap.
 - [ ] **Depth and calibration** for real navigation: a single 2D image cannot give metric clearance or guarantee collision-free motion. Add stereo/depth (FinnWoodlands has depth), camera intrinsics and the vehicle footprint, and convert the image-plane corridor to a ground-plane cost map.
 - [ ] **Closed-loop validation**: the direction labels are steering *suggestions*. Test on the vehicle in a safe area with an independent safety stop before using them as commands.
@@ -605,7 +624,7 @@ tree-detection/
 ## 11. Testing
 
 ```bash
-.venv/bin/python -m pytest           # 106 tests
+.venv/bin/python -m pytest           # 120 tests
 .venv/bin/python -m pytest -v        # verbose
 ```
 

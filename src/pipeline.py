@@ -53,6 +53,9 @@ class NavParams:
     imgsz: int = 480
     path_method: str = CLASSICAL
     allow_grass: bool = True
+    hazard_detector: bool = False         # add COCO person/vehicle/animal boxes (models/yolov8n.pt) to the obstacle footprints
+    veg_weight: float | None = None       # set -> confidence-aware fusion for terrain-aware methods (overrides the veto)
+    obstacle_threshold: float = 0.5
     veto_threshold: float | None = 0.7  # soft veto for terrain-aware methods (None = argmax veto); 0.7 scored best on GT frames
     trunk_weights: str = "tree_trunk.pt"
     path_weights: str = "forest_path_seg.pt"
@@ -71,6 +74,7 @@ class NavOutput:
     timings: dict = field(default_factory=dict)
     warnings: list = field(default_factory=list)
     plants: dict = field(default_factory=dict)
+    hazards: list = field(default_factory=list)
 
 
 def resolve_device(pref: str = "auto") -> tuple[str, str | None]:
@@ -136,13 +140,14 @@ class Models:
         raise ValueError(name)
 
     def segmenter(self, method: str, imgsz: int, device: str, path_weights: str, allow_grass: bool = True,
-                  veto_threshold: float | None = None) -> Segmenter | None:
+                  veto_threshold: float | None = None, veg_weight: float | None = None,
+                  obstacle_threshold: float = 0.5) -> Segmenter | None:
         if method == TERRAIN:
-            return make_terrain_segmenter(make_rugd_segmenter(self.rugd(), imgsz, device), allow_grass, veto_threshold)
+            return make_terrain_segmenter(make_rugd_segmenter(self.rugd(), imgsz, device), allow_grass, veto_threshold, veg_weight, obstacle_threshold)
         if method == TERRAIN_DEEPSCENE:
-            return make_terrain_segmenter(self.primary("DeepScene", imgsz, device), allow_grass, veto_threshold)
+            return make_terrain_segmenter(self.primary("DeepScene", imgsz, device), allow_grass, veto_threshold, veg_weight, obstacle_threshold)
         if method == TERRAIN_ADE:
-            return make_terrain_segmenter(self.primary("ADE20K", imgsz, device), allow_grass, veto_threshold)
+            return make_terrain_segmenter(self.primary("ADE20K", imgsz, device), allow_grass, veto_threshold, veg_weight, obstacle_threshold)
         if method == DEEPSCENE:
             return self.primary("DeepScene", imgsz, device)
         if method == ADE:
@@ -169,6 +174,8 @@ def run_navigation(image: np.ndarray, models: Models, params: NavParams | None =
         out.warnings.append(warn)
     t = time.perf_counter()
     out.boxes = infer.detect_trunks(models.yolo(p.trunk_weights), image, p.conf, p.imgsz, device)
+    if p.hazard_detector:
+        out.hazards = infer.detect_hazards(models.yolo("yolov8n.pt"), image, 0.25, 640, device)
     out.timings["trunk_s"] = time.perf_counter() - t
     if p.path_method == "Off":
         out.warnings.append("Path method is Off: navigation is disabled.")
@@ -176,13 +183,14 @@ def run_navigation(image: np.ndarray, models: Models, params: NavParams | None =
         return out
     t = time.perf_counter()
     try:
-        seg = models.segmenter(p.path_method, p.imgsz, device, p.path_weights, p.allow_grass, p.veto_threshold)
+        seg = models.segmenter(p.path_method, p.imgsz, device, p.path_weights, p.allow_grass, p.veto_threshold,
+                               p.veg_weight, p.obstacle_threshold)
     except ModelUnavailable as exc:
         if p.path_method != TERRAIN:
             raise
         seg = None  # classical fallback for the default method, clearly reported
         out.warnings.append(f"Terrain model unavailable, using the classical baseline (plants shown approximately): {exc}")
-    out.trav = detect_traversable_region(image, out.boxes, seg, p.trav)
+    out.trav = detect_traversable_region(image, list(out.boxes) + list(out.hazards), seg, p.trav)
     out.timings["segment_s"] = time.perf_counter() - t
     out.plants = plant_detections(out.trav)
     t = time.perf_counter()
@@ -200,6 +208,7 @@ def run_navigation(image: np.ndarray, models: Models, params: NavParams | None =
         "continuous_route": out.plan.continuous and out.plan.success,
         "clearance_px": out.plan.clearance_px if out.plan.success else None,
         "stop_reason": out.plan.reason,
+        "stop_code": out.plan.reason_code,
     }
     out.warnings.extend(out.trav.notes)
     out.timings["total_s"] = time.perf_counter() - t0

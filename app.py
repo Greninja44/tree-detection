@@ -61,6 +61,12 @@ with st.sidebar:
                            help="Block a pixel only where the terrain model's obstacle+vegetation probability is high, instead of wherever those classes win. "
                                 "More routes found on the ground-truth check; weaker veto. Does not fix leaf-litter false stops.")
         veto_t = st.slider("Veto threshold", 0.5, 0.95, 0.7, 0.05) if soft else None
+        hazards_on = st.checkbox("Detect people / vehicles / animals as obstacles (COCO yolov8n)", False,
+                                 help="Adds their ground footprint to the obstacle mask. Partial coverage: finds people often, machines unreliably. +~0.4 s/frame.")
+        conf_aware = st.checkbox("Confidence-aware fusion instead of the veto (terrain-aware methods)", False,
+                                 help="Hard obstacles only from confirmed obstacle evidence; vegetation only lowers ground confidence. "
+                                      "Weight 1 = strong penalty (default look), 0 = no vegetation penalty (finds leaf-litter routes but loses the vegetation veto).")
+        veg_w = st.slider("Vegetation penalty weight", 0.0, 1.0, 1.0, 0.1) if conf_aware else None
         normalize = st.checkbox("Contrast normalisation (CLAHE) for dark images", True)
 
 up = st.file_uploader("Upload an image or a video", type=["jpg", "jpeg", "png"] + [e[1:] for e in VIDEO_EXT])
@@ -72,7 +78,7 @@ if trunk_w is None:
     st.stop()
 
 params = NavParams(
-    conf=conf, imgsz=imgsz, path_method=method, trunk_weights=trunk_w, device=device, allow_grass=allow_grass, veto_threshold=veto_t,
+    conf=conf, imgsz=imgsz, path_method=method, trunk_weights=trunk_w, device=device, allow_grass=allow_grass, veto_threshold=veto_t, veg_weight=veg_w, hazard_detector=hazards_on,
     nav=NavConfig(lookahead=lookahead / 100, safety_margin=margin / 100, smoothing=smoothing,
                   min_confidence=min_conf, min_clearance=clear / 100),
     trav=TravConfig(min_confidence=p_trav, normalize_lighting=normalize),
@@ -114,7 +120,7 @@ def render_video(upload) -> None:
             try:
                 for n, (idx, frame, out) in enumerate(iter_navigation(path, models(), params, stride, max_frames), 1):
                     nav_img = nav_render.draw_navigation(frame, out.trav, out.plan, out.direction)
-                    det_img = nav_render.draw_detections(frame, out.boxes, out.trav, out.plants)
+                    det_img = nav_render.draw_detections(frame, out.boxes, out.trav, out.plants, out.hazards)
                     panels.append((small(frame), small(det_img), small(nav_img)))
                     navs.append(small(nav_img, 960))
                     m = out.metrics
@@ -212,7 +218,7 @@ if m:
         note += f" · partial route ({out.plan.reached_fraction:.0%} of look-ahead)" if out.plan.partial else ""
         st.caption(note)
     else:
-        st.error(f"{STOP}: {out.plan.reason}")
+        st.error(f"{STOP} [{out.plan.reason_code}]: {out.plan.reason}")
 
 if out.plants:
     src = out.plants.get("source", "")
@@ -221,7 +227,7 @@ if out.plants:
 
 a, b, c = st.columns(3)
 a.image(rgb(img), caption="Original", width="stretch")
-b.image(rgb(nav_render.draw_detections(img, out.boxes, out.trav, out.plants)), caption="Plants, trees & obstacles", width="stretch")
+b.image(rgb(nav_render.draw_detections(img, out.boxes, out.trav, out.plants, out.hazards)), caption="Plants, trees & obstacles", width="stretch")
 if out.trav is not None:
     c.image(rgb(nav_render.draw_navigation(img, out.trav, out.plan, out.direction)), caption="Navigation (visual estimate)", width="stretch")
 else:
