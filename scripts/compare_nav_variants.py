@@ -29,7 +29,7 @@ def main() -> None:
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    models, params = Models(), NavParams(path_method="Terrain-aware (classical + DeepScene)")
+    models, params = Models(), NavParams()
     ds_fn = make_deepscene_segmenter(str(models.deepscene_path()))
     frames = {f["image"]: f for f in el.load_frames()}
     rows = []

@@ -117,9 +117,9 @@ def test_hybrid_is_vetoed_by_vegetation_but_veto_variant_is_not():
     assert (fuse_obstacle_veto(prim, base).p_trav > 0.5).all()
 
 
-def test_classical_is_the_default_path_method():
-    from src.pipeline import CLASSICAL, PATH_METHODS, NavParams
-    assert PATH_METHODS[0] == CLASSICAL and NavParams().path_method == CLASSICAL
+def test_navigation_is_the_default_mode_with_a_fast_preview_alternative():
+    from src.pipeline import FAST, NAVIGATION, PATH_METHODS, NavParams
+    assert PATH_METHODS == (NAVIGATION, FAST) and NavParams().path_method == NAVIGATION
 
 
 def _terrain_seg():
@@ -187,14 +187,17 @@ def test_segformer_wrapper_maps_classes_probabilities_and_sky():
     assert seg.label_names[3] == "path" and seg.labels is not None
 
 
-def test_available_methods_only_lists_methods_with_weights(tmp_path, monkeypatch):
+def test_navigation_mode_needs_both_segmentation_models(tmp_path, monkeypatch):
     import src.pipeline as pl
     monkeypatch.setattr(pl, "MODELS", tmp_path)
     monkeypatch.setattr(pl.infer, "RUGD_DIR", tmp_path / "rugd")
-    assert pl.available_methods() == [pl.CLASSICAL, "Off"]
+    assert pl.available_methods() == [pl.FAST]                                   # no weights: only the fast preview
     (tmp_path / "deepscene").mkdir()
     (tmp_path / "deepscene" / "fcn_resnet18.onnx").write_bytes(b"x")
-    assert pl.TERRAIN_DEEPSCENE in pl.available_methods() and pl.TERRAIN not in pl.available_methods()
+    assert pl.available_methods() == [pl.FAST]                                   # DeepScene alone is not enough
+    (tmp_path / "rugd").mkdir()
+    (tmp_path / "rugd" / "model.safetensors").write_bytes(b"x")
+    assert pl.available_methods() == [pl.NAVIGATION, pl.FAST]
 
 
 def test_soft_veto_keeps_ground_the_model_is_unsure_about():

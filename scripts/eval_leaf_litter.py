@@ -21,7 +21,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-import eval_navigation as ev  # noqa: E402
 from src import infer  # noqa: E402
 from src.navigation import estimate_navigation_direction, plan_local_path  # noqa: E402
 from src.pipeline import Models, NavParams  # noqa: E402
@@ -32,6 +31,16 @@ ANN = PROJECT_ROOT / "data/leaf_litter_pilot/annotations.json"
 CACHE = PROJECT_ROOT / "reports/leaf_litter/cache"
 W_GRID = [1.0, 0.6, 0.4, 0.3, 0.2, 0.0]
 COCO_HAZARD_IDS = [0, 1, 2, 3, 5, 6, 7] + list(range(14, 24))   # person, bicycle, car, motorcycle, bus, train, truck, animals
+
+
+def gt_mask(label_file: Path, shape) -> np.ndarray:
+    """Rasterise a YOLO-seg polygon label file (FinnWoodlands groomed track) to a boolean mask."""
+    H, W = shape
+    m = np.zeros((H, W), np.uint8)
+    for line in label_file.read_text().splitlines():
+        v = np.array(line.split()[1:], np.float32).reshape(-1, 2) * [W, H]
+        cv2.fillPoly(m, [v.astype(np.int32)], 1)
+    return m.astype(bool)
 
 
 def find_image(stem: str) -> Path:
@@ -80,7 +89,7 @@ RUGD_METHODS = {
 
 
 # Multi-source (needs both primaries); designed AFTER seeing final_test results of the RUGD variants -> exploratory, see report.
-MULTI_METHODS = ["multi-source", "multi-source +coco"]
+MULTI_METHODS = ["multi-source", "multi-source +coco", "rugd+classical multi (no DeepScene)", "rugd+classical multi (no DeepScene) +coco"]
 
 
 def rugd_cached(f, models, params, norm, cache):
@@ -143,7 +152,7 @@ def prepare_one(f, models, params, ds_fn, with_rugd=False):
     t0 = time.perf_counter(); ds = ds_fn(norm); cl = segment_classical(norm, params.trav); seg_t = time.perf_counter() - t0
     gt, gt_ang = None, None
     if f.get("gt_label") is not None:
-        gt = ev.gt_mask(f["gt_label"], (H, W))
+        gt = gt_mask(f["gt_label"], (H, W))
         nav = params.nav
         tgt = nav.start_y - nav.heading_lookahead * nav.lookahead
         ys, xs = np.nonzero(gt[int((tgt - .05) * H):int((tgt + .05) * H)])
@@ -154,7 +163,11 @@ def prepare_one(f, models, params, ds_fn, with_rugd=False):
 
 def run_method(name, fuse, f, p, params):
     t0 = time.perf_counter()
-    if name.startswith("multi-source"):
+    if name.startswith("rugd+classical multi"):   # ablation: DeepScene removed (a source that never says ground or obstacle)
+        z = np.zeros_like(p["ds"].p_trav)
+        null_ds = SegOutput(p["ds"].classes, z, p["ds"].valid | True, "none", [], None, None, None, z, z)
+        seg = fuse_multi_source(p["rg"], null_ds, p["cl"])
+    elif name.startswith("multi-source"):
         seg = fuse_multi_source(p["rg"], p["ds"], p["cl"])
     else:
         seg = fuse(p["rg"] if name in RUGD_METHODS else p["ds"], p["cl"])
@@ -217,7 +230,7 @@ def main() -> None:
     ap.add_argument("--output", default="reports/leaf_litter_metrics.json")
     ap.add_argument("--with-rugd", action="store_true", help="also score the RUGD-Segformer variants (cached on disk; ~5 s/frame first time)")
     a = ap.parse_args()
-    models, params = Models(), NavParams(path_method="Terrain-aware (classical + DeepScene)")
+    models, params = Models(), NavParams()
     frames = load_frames()
     print(f"frames: {len(frames)} (pilot labelled + Finn GT)", flush=True)
     ds_fn = make_deepscene_segmenter(str(models.deepscene_path()))

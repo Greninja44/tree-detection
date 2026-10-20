@@ -120,9 +120,9 @@ def test_reason_code_low_confidence_and_code_vocabulary():
 
 
 def test_defaults_are_unchanged():
-    from src.pipeline import CLASSICAL, NavParams
+    from src.pipeline import NAVIGATION, NavParams
     p = NavParams()
-    assert p.path_method == CLASSICAL and p.veto_threshold == 0.7 and p.veg_weight is None and p.obstacle_threshold == 0.5
+    assert p.path_method == NAVIGATION and p.conf == 0.4 and p.imgsz == 480 and p.allow_grass is True
     assert NavConfig().min_confidence == 0.35 and NavConfig().safety_margin == 0.02 and TravConfig().min_confidence == 0.5
 
 

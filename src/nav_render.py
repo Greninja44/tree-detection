@@ -27,11 +27,11 @@ def _text(img, text, org, scale=0.55, color=WHITE, thick=1, bg=True):
 
 
 TERRAIN_COLORS = {"grass": (80, 230, 120), "bush": (200, 60, 220), "tree": (40, 140, 40), "log": (0, 140, 255),
-                  "rock": (0, 140, 255), "rock-bed": (0, 170, 255), "water": (230, 140, 30)}
+                  "rock": (0, 140, 255), "rock-bed": (0, 170, 255), "water": (230, 140, 30), "person": (0, 0, 255), "vehicle": (0, 0, 255)}
 
 
 def draw_detections(image: np.ndarray, boxes: Sequence[Sequence[float]], trav: TraversabilityResult | None = None,
-                    plants: dict | None = None, hazards: Sequence[Sequence[float]] = ()) -> np.ndarray:
+                    plants: dict | None = None) -> np.ndarray:
     """Panel 2: plants/terrain (grass, bushes, trees, logs, rocks, water - tinted and listed), trunk boxes (orange),
     other obstacles (red outline) and bush instances (magenta boxes)."""
     out = image.copy()
@@ -56,9 +56,6 @@ def draw_detections(image: np.ndarray, boxes: Sequence[Sequence[float]], trav: T
     for x0, y0, x1, y1, c in boxes:
         cv2.rectangle(out, (int(x0), int(y0)), (int(x1), int(y1)), ORANGE, 2)
         _text(out, f"trunk {c:.2f}", (int(x0), max(14, int(y0) - 4)), 0.45, ORANGE)
-    for x0, y0, x1, y1, c in hazards:
-        cv2.rectangle(out, (int(x0), int(y0)), (int(x1), int(y1)), RED, 3)
-        _text(out, f"hazard {c:.2f}", (int(x0), max(14, int(y0) - 4)), 0.45, RED)
     n_b = len((plants or {}).get("bushes", []))
     _text(out, f"{len(boxes)} trunk(s)" + (f", {n_b} bush(es)" if n_b else ""), (6, 18), 0.55)
     y = 40

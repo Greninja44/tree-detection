@@ -1,9 +1,10 @@
-"""Train the tree-trunk detector and the forest-path segmenter on a (Windows) GPU PC.
+"""Train the tree-trunk detector on a (Windows) GPU PC.
 
 Usage (from this folder, after unzipping the datasets next to this script):
     python train_on_pc.py                 # both models
     python train_on_pc.py --only trunk    # or: --only path
-Outputs: results/tree_trunk.pt and results/forest_path_seg.pt  -> copy both to the Jetson's models/ folder.
+Output: results/tree_trunk.pt  -> copy it to the Jetson's models/ folder.
+(The path segmenter that used to be trained here was replaced by the pretrained RUGD + DeepScene models.)
 """
 import argparse
 import shutil
@@ -38,7 +39,7 @@ def train(model: str, data: Path, name: str, out_name: str, epochs: int, imgsz: 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--only", choices=["trunk", "path"])
+    ap.add_argument("--only", choices=["trunk"], help="kept for compatibility; only the trunk model is trained")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--batch", type=int, default=16, help="Lower (8/4) if you hit CUDA out-of-memory.")
@@ -55,9 +56,6 @@ def main() -> None:
     if a.only in (None, "trunk"):
         train(a.trunk_model, write_yaml("trunk", HERE / "data", "tree_trunk"), f"tree_trunk{a.tag}", f"tree_trunk{a.tag}.pt",
               a.epochs, a.imgsz, a.batch, a.patience, hsv_v=0.6, hsv_s=0.7, cos_lr=True, close_mosaic=15)
-    if a.only in (None, "path"):
-        train("yolov8s-seg.pt", write_yaml("path", HERE / "data_path", "path"), f"forest_path_seg{a.tag}", f"forest_path_seg{a.tag}.pt",
-              a.epochs, a.imgsz, a.batch, a.patience, hsv_v=0.6, hsv_s=0.7)
 
 
 if __name__ == "__main__":  # required on Windows (dataloader worker processes)

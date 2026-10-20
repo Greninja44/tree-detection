@@ -50,7 +50,7 @@ def outcome(plan) -> str:
     return "ROUTE" if plan.success else "STOP"
 
 
-def diagnose(img: np.ndarray, models: Models, params: NavParams, out_path: Path | None = None) -> dict:
+def diagnose(img: np.ndarray, models: Models, params: NavParams, out_path: Path | None = None, veto_threshold: float = 0.7) -> dict:
     H, W = img.shape[:2]
     device = "cpu"
     norm, _ = normalize_lighting(img)
@@ -59,7 +59,7 @@ def diagnose(img: np.ndarray, models: Models, params: NavParams, out_path: Path 
     ds_primary = make_deepscene_segmenter(onnx)(norm)
     classical = segment_classical(norm, params.trav)
     probs = deepscene_probs(onnx, norm)
-    soft = fuse_terrain_aware(ds_primary, classical, True, params.veto_threshold)
+    soft = fuse_terrain_aware(ds_primary, classical, True, veto_threshold)
     nav, tc = params.nav, params.trav
 
     def run(seg, boxes_=boxes):
@@ -118,11 +118,11 @@ def main() -> None:
     ap.add_argument("--veto-threshold", type=float, default=0.7)
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    models, params = Models(), NavParams(path_method="Terrain-aware (classical + DeepScene)", veto_threshold=a.veto_threshold)
+    models, params = Models(), NavParams()
     res = {}
     for f in a.images:
         img = cv2.imread(f)
-        res[Path(f).stem] = diagnose(img, models, params, out / f"diag_{Path(f).stem}.jpg")
+        res[Path(f).stem] = diagnose(img, models, params, out / f"diag_{Path(f).stem}.jpg", a.veto_threshold)
         print(Path(f).stem, json.dumps(res[Path(f).stem]["outcomes"]), flush=True)
     (out / "diagnosis.json").write_text(json.dumps(res, indent=2))
 
