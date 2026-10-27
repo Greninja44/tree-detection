@@ -10,7 +10,7 @@ import streamlit as st
 from src import nav_render
 from src.camera import Camera, CameraError, list_cameras
 from src.navigation import DirectionSmoother, NavConfig
-from src.pipeline import FAST, MODELS, NAVIGATION, Models, ModelUnavailable, NavParams, available_methods, run_navigation
+from src.pipeline import DEPTH, FAST, MODELS, NAVIGATION, Models, ModelUnavailable, NavParams, available_methods, run_navigation
 from src.traversability import TravConfig
 
 st.set_page_config(page_title="Forest Navigator", page_icon="🌲", layout="wide")
@@ -69,15 +69,17 @@ def status_card(out) -> None:
 
 
 # ---------------------------------------------------------------------------------------------------------------- sidebar
-available = available_methods()
+available = [m for m in (DEPTH, NAVIGATION, FAST) if m in available_methods()]
 with st.sidebar:
     st.title("🌲 Forest Navigator")
     st.caption("Live camera input only. The route, obstacles and heading are estimated from the picture alone.")
-    fast = st.toggle("Fast preview", value=(NAVIGATION not in available), disabled=(NAVIGATION not in available),
-                     help="Colour/texture ground estimate only (~0.4 s/frame). It has no obstacle checks and can route through people, "
-                          "machines and dense vegetation. The default Navigation mode takes ~5 s/frame on the Jetson CPU.")
-    if NAVIGATION not in available:
-        st.warning("Navigation models are missing (models/rugd_segformer, models/deepscene), so only the Fast preview is available. See the README.")
+    labels = {DEPTH: "RGB depth (~1 s/frame, recommended)", NAVIGATION: "Navigation (~5 s/frame, slower)", FAST: "Fast preview (no obstacle checks)"}
+    method = st.radio("Method", available, format_func=labels.get,
+                      help="RGB depth: monocular depth + fitted ground plane; anything standing proud of the ground is an obstacle. "
+                           "Navigation: segmentation models; slower, so the route lags the camera. "
+                           "Fast preview: colour/texture only; it can route through people, machines and dense vegetation.")
+    if len(available) < 3:
+        st.warning("Some models are missing (models/depth_anything_v2_small, models/rugd_segformer, models/deepscene); see the README.")
     cams = list_cameras() if "cams" not in st.session_state else st.session_state["cams"]
     st.session_state["cams"] = cams
     cam_index = st.selectbox("Camera", cams or [0], format_func=lambda i: f"/dev/video{i}")
@@ -98,7 +100,7 @@ if not trunk_files:
     st.stop()
 
 params = NavParams(
-    conf=conf, imgsz=imgsz, path_method=FAST if fast else NAVIGATION, allow_grass=allow_grass,
+    conf=conf, imgsz=imgsz, path_method=method, allow_grass=allow_grass,
     trunk_weights="tree_trunk.pt" if "tree_trunk.pt" in trunk_files else trunk_files[0], device=device,
     nav=NavConfig(lookahead=lookahead / 100, safety_margin=margin / 100, smoothing=smoothing, min_confidence=min_conf),
     trav=TravConfig(),
@@ -121,6 +123,8 @@ except CameraError as exc:
     st.error(str(exc))
     st.stop()
 
+for k in [k for k in models()._cache if k[0] == "depth_seg"]:   # new session: forget the previous ground plane
+    models()._cache.pop(k)
 smoother = DirectionSmoother(config=params.nav, start_stopped=True)
 try:
     while True:   # a widget change reruns the script, which ends this loop and releases the camera

@@ -118,8 +118,8 @@ def test_hybrid_is_vetoed_by_vegetation_but_veto_variant_is_not():
 
 
 def test_navigation_is_the_default_mode_with_a_fast_preview_alternative():
-    from src.pipeline import FAST, NAVIGATION, PATH_METHODS, NavParams
-    assert PATH_METHODS == (NAVIGATION, FAST) and NavParams().path_method == NAVIGATION
+    from src.pipeline import DEPTH, FAST, NAVIGATION, PATH_METHODS, NavParams
+    assert PATH_METHODS == (NAVIGATION, FAST, DEPTH) and NavParams().path_method == NAVIGATION
 
 
 def _terrain_seg():

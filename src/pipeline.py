@@ -24,13 +24,15 @@ from src.traversability import (Segmenter, TravConfig, TraversabilityResult, det
 MODELS = infer.PROJECT_ROOT / "models"
 NAVIGATION = "Navigation"
 FAST = "Fast preview"
-PATH_METHODS = (NAVIGATION, FAST)
+DEPTH = "RGB depth"
+PATH_METHODS = (NAVIGATION, FAST, DEPTH)
 
 
 def available_methods() -> list[str]:
     """Navigation needs the RUGD and DeepScene weights; the fast preview needs nothing."""
     ok = (infer.RUGD_DIR / "model.safetensors").exists() and (MODELS / "deepscene" / "fcn_resnet18.onnx").exists()
-    return [NAVIGATION, FAST] if ok else [FAST]
+    methods = [NAVIGATION, FAST] if ok else [FAST]
+    return methods + [DEPTH] if (MODELS / "depth_anything_v2_small" / "model.safetensors").exists() else methods
 
 
 class ModelUnavailable(RuntimeError):
@@ -107,10 +109,27 @@ class Models:
             raise ModelUnavailable(f"DeepScene model not found: {p}.", "See README (Model setup) for the download command, or use the Fast preview.")
         return p
 
+    def depth(self, device: str):
+        p = MODELS / "depth_anything_v2_small"
+        if not (p / "model.safetensors").exists():
+            raise ModelUnavailable(f"Depth model not found in {p}.",
+                                   "Run: python -c \"from huggingface_hub import snapshot_download as s; "
+                                   "s('depth-anything/Depth-Anything-V2-Small-hf', local_dir='models/depth_anything_v2_small')\"")
+        if ("depth", device) not in self._cache:
+            from src.depth_ground import DepthModel
+            self._cache[("depth", device)] = DepthModel(str(p), device)
+        return self._cache[("depth", device)]
+
     def segmenter(self, method: str, imgsz: int, device: str, allow_grass: bool = True) -> Segmenter | None:
         if method == NAVIGATION:
             rg, ds = make_rugd_segmenter(self.rugd(), imgsz, device), make_deepscene_segmenter(str(self.deepscene_path()))
             return lambda image: fuse_multi_source(rg(image), ds(image), segment_classical(image), allow_grass)
+        if method == DEPTH:
+            from src.depth_ground import make_depth_segmenter
+            key = ("depth_seg", device)   # keep one segmenter per device so the ground plane is smoothed over time
+            if key not in self._cache:
+                self._cache[key] = make_depth_segmenter(self.depth(device))
+            return self._cache[key]
         return None  # fast preview: classical estimate
 
 
