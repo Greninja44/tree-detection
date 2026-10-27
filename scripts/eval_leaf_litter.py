@@ -121,7 +121,7 @@ def hazard_hit(points: np.ndarray, hazards, W: int, H: int) -> bool:
     return False
 
 
-def prepare_one(f, models, params, ds_fn, with_rugd=False):
+def prepare_one(f, models, params, ds_fn, with_rugd=False, depth_fn=None):
     """Everything needed for one frame (kept only while that frame is being scored, to bound memory)."""
     CACHE.mkdir(parents=True, exist_ok=True)
     img = cv2.imread(str(find_image(f["image"])))
@@ -158,7 +158,8 @@ def prepare_one(f, models, params, ds_fn, with_rugd=False):
         ys, xs = np.nonzero(gt[int((tgt - .05) * H):int((tgt + .05) * H)])
         gt_ang = float(np.degrees(np.arctan2(xs.mean() - .5 * W, (nav.start_y - tgt) * H))) if xs.size else None
     rg = rugd_cached(f, models, params, norm, CACHE) if with_rugd else None
-    return dict(img=img, boxes=boxes, coco=coco, rg=rg, ds=ds, cl=cl, W=W, H=H, gt=gt, gt_ang=gt_ang, seg_s=seg_t)
+    dp = depth_fn(norm) if depth_fn else None
+    return dict(img=img, boxes=boxes, coco=coco, rg=rg, dp=dp, ds=ds, cl=cl, W=W, H=H, gt=gt, gt_ang=gt_ang, seg_s=seg_t)
 
 
 def run_method(name, fuse, f, p, params):
@@ -167,6 +168,8 @@ def run_method(name, fuse, f, p, params):
         z = np.zeros_like(p["ds"].p_trav)
         null_ds = SegOutput(p["ds"].classes, z, p["ds"].valid | True, "none", [], None, None, None, z, z)
         seg = fuse_multi_source(p["rg"], null_ds, p["cl"])
+    elif name == "RGB depth":
+        seg = p["dp"]
     elif name.startswith("multi-source"):
         seg = fuse_multi_source(p["rg"], p["ds"], p["cl"])
     else:

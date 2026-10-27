@@ -49,3 +49,4 @@ pc_bundle/*.yaml
 models/deepscene/
 models/ade_segformer_b2/
 models/candidates/
+models/depth_anything_v2_small/
